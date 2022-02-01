@@ -1,0 +1,48 @@
+NOTES
+=====
+
++ bit0 BEFORE the inc/dec determines the indirection chain!
++ BRK use bitmap
++ E show event queue
++ I I/O reset
++ [expr]H history, save PC, contents, ACs, CRY, ION, MSKO
+  set/show history buffer
++ [expr]M   set/display memory cycle
+
+--- event QUE ------------------------------------------------------------------
++ all events in the QUE are relative to ioTime
++ ioTime should be updated, when a new entry inserted at the 1st place
+  in the QUE
+  update eventTime = ioTime + QUE->timeout
++ eventTime is the first absolute time when an event will occur
+  should be updated when ioTime changes
+
+
+- LPT
+  printing trigger: buffer full or got CR/LF/FF
+  DOA sets up chrbuf of LPT
+  Start inserts chBuf into zoneBuf (6us)
+  zoneBuf gets printed => reset to position zero
+  FF time
+  LF time
+
+- DSK, DKP
+  DSK fixed-head disk   reNOVAte demo, simH
+   ...DDDTTTTTTTSSS
+      8 disk, 128 track, 8 sector      =>   2MW max. (8 disks)
+  DKP moving-head disk  reNOVAte demo, simH
+   eg 4047
+      8bit cylinder              256   => 8MW (4 disks)
+      2bit drive                 4
+      1bit surface (max 6bit)    2
+      4bit sector                16
+  DZP Zebra controller (6060 - 190MB)
+      2bit    drive                 4  => 1024MW (4 disks)
+     10bit cylinder (max 16bit)  1024
+      5bit  surface (max  6bit)    32
+      5bit   sector                32
+      
+      16384MW/disk   32GB
+
+- Nova 840 is the first mapped Nova => can run MRDOS (mapped RDOS)
+- URDOS is unmapped RDOS

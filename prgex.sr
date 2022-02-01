@@ -1,0 +1,105 @@
+SQRT:    SUBO  1,1         ;clear AC1 and carry
+         MOVOL 1,2         ;AC2 gets 1 + 2xAC1 (2n + 1)
+         SUBZ  2,0,SNC     ;subtract next odd number; still positive?
+         JMP   0,3         ;no, exit with n one less than number of odd numbers tried
+         INC   1,1         ;yes, increment n
+         JMP   SQRT+1      ;and ty next odd number
+
+
+; AC1 = AC0 \/ AC1
+OR:      COM   0,0         ;~B
+         AND   0,1         ;~B /\ A in AC1
+         ADC   1,1         ;~~B + ~B /\ A = B + ~B /\ A in AC1
+
+
+; AC1 := AC0 >< AC1
+XOR:     MOV   1,2         ;move A to AC2
+         ANDZL 0,2         ;2(A /\ B) in AC2
+         ADD   0,1         ;A + B
+         SUB   2,1         ;A + B - 2(A /\ B)
+
+
+DNEG:    NEG   1,1,SNR
+         NEG   0,0,SKP     ;low order zero
+         COM   0,0         ;low order nonzero
+
+
+DADD:    ADDZ  3,1,SZC
+         INC   2,2
+         ADD   2,0
+
+
+DSUB:    SUBZ  3,1,SZC
+         SUB   2,0,SKP
+         ADC   2,0
+
+
+:MPYU:   SUBC  0,0         ;clear AC0, don't disturb carry
+.MPYA:   STA   3,.CB03     ;save return
+         LDA   3,.CB20     ;get step count
+
+.CB99:   MOVR  1,1,SNC     ;check next multiplier bit
+         MOVR  0,0,SKP     ;0 - shift
+         ADDZR 2,0         ;1 - add multiplicand and shift
+         INC   3,3,SZR     ;count step, complementing carry on final count
+         JMP   .CB99       ;iterate loop
+
+         MOVCR 1,1         ;shift in last low bit (which was complemented by final count) and
+         JMP   @.CB03      ;restore carry
+
+.CB03:   0
+.CB20:   -20               ;16 steps
+
+
+
+.DIVI:   SUB   0,0         ;integer divide - clear high part
+.DIVU:   STA   3,.CC03     ;save return
+         SUBZ# 2,0,SZC     ;test for overflow
+         JMP   .CC99       ;yes, exit (AC0 >= AC2)
+         LDA   3,.CC20     ;get step count
+         MOVZL 1,1         ;shift dividend low part
+
+.CC98:   MOVL  0,0         ;shift dividend high part
+         SUB#  2,0,SZC     ;does divisor go in?
+         SUB   2,0         ;yes
+         MOVL  1,1         ;shift dividend low part
+         INC   3,3,SZR     ;count step
+         JMP   .CC98       ;iterate loop
+
+         SUBO  3,3,SKP     ;done, clear carry
+.CC99:   SUBZ  3,3         ;set carry
+         JMP   @.CC03      ;return
+
+.CC03:   0
+.CC20:   -20               ;16 steps
+
+
+PICK:    LDA   2,@0,3      ;get byte pointer
+         ISZ   @0,3        ;increment pointer
+         MOVZR 2,2         ;put address in right place (left/right bit to carry)
+         LDA   0,0,2       ;bring memory word to AC0
+         LDA   2,C377      ;get 8bit mask
+         MOV   0,0,SZC     ;test carry for which half
+         MOVS  0,0         ;swap byte from left to right
+         AND   2,0,SNR     ;mask out unwanted byte and test for zero
+         JMP   1,3         ;zero, return to call + 2
+         JMP   2,3         ;nonzero, return to call + 3
+C377:    377               ;8bit mask (1s in right half)
+
+
+MDVMUL:  DOA   0,MDV       ;AC0 to A(AC)
+         DOB   1,MDV       ;AC1 to B(MQ)
+         MUL               ;= DOCP 2,MDV = AC2 to C, multiply
+         NIO   0           ;wait for result (6.8us)
+         JMP   .+1
+         DIA   0,MDV       ;put double length product in AC0
+         DIA   1,MDV       ;and AC1
+
+MDVDIV:  DOA   0,MDV
+         DOB   1,MDV
+         DIV               ;= DOCS 2,MDV but no overflow check
+         MOV#  0,0         ;wait for result (7.2us)
+         JMP   .+1
+         DIA   0,MDV
+         DIB   1,MDV
+
