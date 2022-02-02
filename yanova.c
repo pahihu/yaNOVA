@@ -21,7 +21,9 @@ int DBG=0;
 typedef unsigned char Byte;
 typedef unsigned short Word;
 typedef unsigned int DWord;
-typedef enum{false,true} Flag;
+typedef enum{false,true} Flag;                  /* Boolean */
+typedef unsigned long Tyme;                     /* time measured in 0.1us */
+
 
 #define ABS(x)    ((x)<0? -(x):(x))
 
@@ -46,6 +48,8 @@ void devPulse(int dev);
 void doIO(int dt);
 void disasm(Word IR);
 char *io_devs(int dev);
+Word memReadIO(Word adr);
+void memWriteIO(Word adr);
 
 /* --- D E V I C E S -------------------------------------------------------- */
 
@@ -73,8 +77,11 @@ char *io_devs(int dev);
 typedef enum {IOC_NONE, IOC_START, IOC_CLEAR, IOC_PULSE} CtrlFn;
 typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
 
-#define LPT_NBUF  24
-#define LPT_NZONE  6
+#define LPT_NBUF     24
+#define LPT_NZONE     6
+#define LPT_CHBUF    buf[BUF_A]
+#define DSK_DTS      buf[BUF_A]
+#define DSK_ACNT     buf[BUF_B] 
 
 typedef struct _Device {
    Byte code;        /* device code */
@@ -99,7 +106,9 @@ typedef struct _Device {
          PrinterOp op;  /* LPT operation */
       } LPT;
       struct {
-         Word dummy;
+         Word status;   /* status flags      */
+         Tyme lastIO;   /* last Start/Pulse  */
+         Word lastDTS;  /* last sector       */
       } DSK;
       struct {
          Word dummy;
@@ -111,14 +120,18 @@ typedef struct _Device {
 #define ASC_FF  014
 #define ASC_CR  015
 
-/* time measured in 0.1us */
-unsigned long elapsedTime; /* elapsed time 0.1us */
-unsigned long memTime;     /* memory time */
-Flag memCycle;             /* cycle exact memory time */
-unsigned long ioTime;      /* updated at every I/O Start/Pulse */
-                           /* all QUE timeouts are relative to this time */
-unsigned long eventTime;   /* next event time in QUE */
+Tyme elapsedTime; /* elapsed time 0.1us */
+Tyme memTime;     /* memory time */
+Flag memCycle;    /* cycle exact memory time */
+Tyme ioTime;      /* updated at every I/O Start/Pulse */
+                  /* all QUE timeouts are relative to this time */
+Tyme eventTime;   /* next event time in QUE */
 unsigned long numInstr;    /* number of instructions executed */
+
+Tyme usince(Tyme base)
+{
+   return (elapsedTime - base) / 10;
+}
 
 Device *BUS;         /* I/O bus, fastest device(s) first */
 Device *QUE;         /* event queue, most recent device event first */
@@ -255,6 +268,18 @@ Word devIN(int dev, int reg)                    /* Device INPUT */
       if (BUF_A == reg)                         /* read status     */
          w = NULL == devs[dev].fd? 0 : 1;       /* printer online? */
       break;
+   case DEV_DSK:
+      switch (reg) {
+      case BUF_A:
+         /* XXX status */
+         break;
+      case BUF_B:
+         break;
+      case BUF_C:
+         if (devs[dev].DSK_DTS & 0100000)
+            fprintf(stderr,"%06o %06o Disc Maintenance!\n",PC,M[PC]);
+         break;
+      }
    }
 
    return w;
@@ -318,6 +343,78 @@ void enqueIO(int dev, CtrlFn fn)                /* Enqueue I/O operation */
    eventTime = ioTime + QUE->timeout;           /*    and eventTime */
 }
 
+void initDSK(int dev)                           /* Init DSK operation */
+{
+   Tyme dt;
+
+   devs[dev].u.DSK.status = 0;                  /* clear status */
+   devs[dev].delay = 2048;                      /* 256 * 8us    */
+
+   dt = usince(devs[dev].u.DSK.lastIO);         /* elapsed time since last I/O*/
+   if (dt > 2048) {                             /* more than 2048us?    */
+      devs[dev].delay += 8400;                  /* avg rotational delay */
+   } else if (1 == devs[dev].DSK_DTS 
+                   - devs[dev].u.DSK.lastDTS) { /* next sector? */
+      devs[dev].delay += 2048 - dt;             /* wait until we got there */
+   }
+   devs[dev].u.DSK.lastIO = elapsedTime;        /* save current time  */
+}
+
+void doioDSK(int dev)                           /* Perform DSK I/O   */
+{
+   off_t offs;
+   Word buf[256];
+   int  i;
+   int  nWords;
+   int  to;
+
+   nWords = 256;                                /* assume a sector */
+   to = devs[dev].timeout / 10;                 /* timeout in us   */
+   if (devs[dev].timeout > 0) {                 /* timeout nonzero (Clear)?*/
+      if (to >= 2048)                           /* more than sector xfer?  */
+         nWords = 0;                            /* no words processed */
+      else
+         nWords = to / 8;                       /* partial I/O only  */
+   }
+   if (0 == nWords)                             /* no words processed? */
+      goto LExit;                               /*    exit  */
+   if (IOC_PULSE == devs[dev].ctrlfn) {         /* was a WRITE?   */
+      for (i = 0; i < nWords; i++)              /* read words     */
+         buf[i] = memReadIO(devs[dev].DSK_ACNT + i);/* from memory*/
+   }
+   offs = (017777 & devs[dev].DSK_DTS) * 512;   /* calc. phys offset */
+   if (-1 == fseeko(devs[dev].fd, offs, SEEK_SET)) {  /* seek failed? */
+      Halt = H_IOErr;                           /*    HALT        */
+      return;
+   }
+   n = nWords;
+   switch (devs[dev].ctrlfn) {
+   case IOC_NONE:
+      break;
+   case IOC_START:                              /* do READ */
+      n = fread(buf, sizeof(Word), nWords, devs[dev].fd);
+      break;
+   case IOC_CLEAR:
+      break;
+   case IOC_PULSE:                              /* do WRITE */
+      n = fwrite(buf, sizeof(Word), nWords, devs[dev].fd);
+      break;
+   }
+   if (n != nWords) {                           /* partial phys. I/O? */
+      Halt = H_IOErr;                           /*    HALT            */
+      return;
+   }
+   if (IOC_START == devs[dev].ctrlfn) {         /* was a READ? */
+      for (i = 0; i < nWords; i++)              /* write words */
+         memWriteIO(devs[dev].DSK_ACNT + i, buf[i]);/* to memory*/
+   }
+LExit:
+   devs[dev].DSK_ACNT += nWords;                /* update address cnt */
+   if (IOC_PULSE == devs[dev].ctrlfn)           /* was a WRITE?       */
+      devs[dev].DSK_ACNT += 2;                  /*    ahead 2 words   */
+   devs[dev].u.DSK.lastDTS = devs[dev].DSK_DTS; /* save last sector   */
+}
+
 void devStart(int dev)                          /* Start device `dev' */
 {
    if (NO_LINE == devs[dev].line)               /* no such device */
@@ -366,7 +463,7 @@ void devStart(int dev)                          /* Start device `dev' */
 
             op = LPT_XMIT; spacing = false;
             pos = devs[dev].u.LPT.pos++;        /* xmit char buffer to zone */
-            devs[dev].u.LPT.buf[pos] = (ch = 0377 & devs[dev].buf[BUF_A]);
+            devs[dev].u.LPT.buf[pos] = (ch = 0377 & devs[dev].LPT_CHBUF;
             switch (ch) {
             case ASC_CR:
                op = LPT_CTRL;
@@ -405,6 +502,9 @@ void devStart(int dev)                          /* Start device `dev' */
             devs[dev].u.LPT.op = op;
          }
          break;
+      case DEV_DSK:                             /* DSK? */
+         initDSK(dev);                          /* init I/O operation */
+         break;
       }
 
       devs[dev].busy = true;                    /* Busy=1,Done=0 */
@@ -417,6 +517,11 @@ void devStart(int dev)                          /* Start device `dev' */
 void devClear(int dev)                          /* Clear device `dev' */ 
 {
    Device *q;
+
+   if (DEV_DSK == dev) {                        /* DSK?  */
+      doioDSK(dev);                             /* do PARTIAL I/O */
+      devs[dev].u.DSK.status = 0;               /* clear status   */
+   }
 
    if (DEV_CPU != dev)                          /* clear buffers */
       devs[dev].buf[BUF_A] = 0;                 /* except CPU buffer A (SW) */
@@ -459,8 +564,12 @@ void devPulse(int dev)                          /* Pulse device `dev' */
       break;
    }
 
+   if (DEV_DSK == dev)                          /* DSK? */
+      initDSK(dev);                             /* init I/O operation */
+
    switch (dev) {
-   case DEV_MDV:                                /* MDV MUL */
+   case DEV_MDV:                                /* MDV MUL   */
+   case DEV_DSK:                                /* DSK Write */
       enqueIO(dev, IOC_PULSE);
       break;
    }
@@ -557,7 +666,7 @@ void devDone(int dev)                           /* Device done, ie timed out */
          ch = getchar();
       devs[dev].buf[BUF_A] = toupper(ch);       /* read upper case char */
       break;
-   case DEV_LPT:
+   case DEV_LPT:                                /* LPT? */
       {  PrinterOp op;
          Flag resetZone;
          int n;
@@ -583,6 +692,9 @@ void devDone(int dev)                           /* Device done, ie timed out */
                devs[dev].u.LPT.zone = 1;        /* reset zone     */
          }
       }
+      break;
+   case DEV_DSK:                                /* DSK? */
+      doioDSK(dev);                             /* perform I/O */
       break;
    }
 
@@ -724,6 +836,9 @@ void initDevs(int nopts, Option *opts)
    devs[DEV_LPT].u.LPT.lines = 0;
    devs[DEV_LPT].u.LPT.op    = LPT_IDLE;
 
+   devs[DEV_DSK].u.DSK.lastIO  = 0;
+   devs[DEV_DSK].u.DSK.lastDTS = 0;
+
    return;
 
 ErrOut:
@@ -783,6 +898,18 @@ void memWrite(Word adr, Word w)
 
    M[adr] = w;
    cycle();
+}
+
+Word memReadIO(Word adr)
+{
+   /* I/O memory read when time alread lapsed ! */
+   return M[077777 & adr];
+}
+
+Word memWriteIO(Word adr, Word w)
+{
+   /* I/O memory write, when time already lapsed ! */
+   M[077777 & adr] = w;
 }
 
 Word memRead(Word adr)
@@ -898,7 +1025,7 @@ Word indirectChain(Word E, int indir)
    return E;
 }
 
-unsigned int KIPS;                              /* instr/ms           */
+Word KIPS;                                      /* instr/ms           */
 unsigned long syncInstr;                        /* sync instr. stream */
 struct timeval tv0;                             /* last timestamp     */
 
