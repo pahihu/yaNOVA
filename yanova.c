@@ -34,6 +34,19 @@ void Assert(char *path,int lno, char *msg, int cond)
 }
 #define ASSERT(cond) Assert(__FILE__,__LINE__,""#cond,cond)
 
+typedef struct _Option {
+   Byte dev;
+   char *key;
+   char *value;
+} Option;
+
+void devClear(int dev);                         /* Forward declarations */
+void devStart(int dev);
+void devPulse(int dev);
+void doIO(int dt);
+void disasm(Word IR);
+char *io_devs(int dev);
+
 /* --- D E V I C E S -------------------------------------------------------- */
 
 #define NDEV      0100
@@ -45,6 +58,7 @@ void Assert(char *path,int lno, char *msg, int cond)
 #define DEV_PTP   (013)
 #define DEV_RTC   (014)
 #define DEV_LPT   (017)
+#define DEV_DSK   (020)
 #define DEV_DKP   (033)
 #define DEV_CPU   (077)
 
@@ -57,6 +71,10 @@ void Assert(char *path,int lno, char *msg, int cond)
 #define NO_LINE   ((Byte)255)
 
 typedef enum {IOC_NONE, IOC_START, IOC_CLEAR, IOC_PULSE} CtrlFn;
+typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
+
+#define LPT_NBUF  24
+#define LPT_NZONE  6
 
 typedef struct _Device {
    Byte code;        /* device code */
@@ -70,8 +88,28 @@ typedef struct _Device {
    CtrlFn ctrlfn;    /* control function, which started the operation */
    struct _Device *bus; /* next device on I/O bus */
    struct _Device *que; /* next device on event queue */
+   char *path;       /* storage file name */
+   FILE *fd;         /* file handle       */
+   union {
+      struct {
+         Byte zone;     /* current zone: 1-LPT_NZONE */
+         Byte pos;      /* buffer position   */
+         Byte buf[LPT_NBUF];/* zone buffer  */
+         unsigned long lines;
+         PrinterOp op;  /* LPT operation */
+      } LPT;
+      struct {
+         Word dummy;
+      } DSK;
+      struct {
+         Word dummy;
+      } DKP;
+   } u;
 } Device;
 
+#define ASC_LF  012
+#define ASC_FF  014
+#define ASC_CR  015
 
 /* time measured in 0.1us */
 unsigned long elapsedTime; /* elapsed time 0.1us */
@@ -87,15 +125,28 @@ Device *QUE;         /* event queue, most recent device event first */
 int IREQ;            /* no. of pending INT requests */
 Flag delayION;       /* delayed ION */
 Device devs[64];
+Flag MissingDev;     /* allow/disallow missing devices */
 
-enum {H_Run,H_Startup,H_Halt,H_Break,H_Undef,H_Indir} Halt;
+enum {
+   H_Run,
+   H_Startup,
+   H_Halt,
+   H_Break,
+   H_Undef,
+   H_Indir,
+   H_MisDev,
+   H_IOErr
+} Halt;
+
 char *halts[] = {
    "run",
    "system startup",
    "halt",
    "break",
    "undefined instruction",
-   "indirection chain"
+   "indirection chain",
+   "missing device",
+   "I/O error"
 };
 
 int  nBKPT;  /* breakpoints */
@@ -135,11 +186,24 @@ Device* insertQUE(int t)
    return p;
 }
 
-void devClear(int dev);                         /* Forward declarations */
-void devStart(int dev);
-void devPulse(int dev);
-void doIO(int dt);
-void disasm(Word IR);
+/* return pointer to previous device in the queue */
+Device* removeQUE(int dev)
+{
+   Device *p, *q;
+
+   p = NULL; q = QUE;
+   while (q) {
+      if (dev == q->code)
+         return p;
+      p = q;
+      q = q->que;
+   }
+
+   /* NB. device not found in the event QUE, but has positive timeout */
+   ASSERT(NULL == QUE);
+
+   return p;
+}
 
 void IORST(void)                                /* IORST */
 {
@@ -147,6 +211,7 @@ void IORST(void)                                /* IORST */
 
    q = BUS;                                     /* clear ctrl FFs in all devs */
    while (q) {
+      q->timeout = 0;                           /* do NOT trigger QUE removal */
       devClear(q->code);                        /* Clear dev (intreq cleared) */
       q->intdis = false;                        /* clear IntDisable */
       q->que = NULL;                            /* clear event QUE ptr */
@@ -163,7 +228,7 @@ Word devIN(int dev, int reg)                    /* Device INPUT */
    w = devs[dev].buf[reg];                      /* default action */
 
    switch (dev) {
-   case DEV_CPU:
+   case DEV_CPU:                                /* --- CPU ------------- */
       switch (reg) {
       case BUF_A:                               /* READS, see def action */
          break;
@@ -185,6 +250,10 @@ Word devIN(int dev, int reg)                    /* Device INPUT */
          IORST();
          break;
       }
+      break;
+   case DEV_LPT:                                /* --- LPT ------- */
+      if (BUF_A == reg)                         /* read status     */
+         w = NULL == devs[dev].fd? 0 : 1;       /* printer online? */
       break;
    }
 
@@ -257,6 +326,22 @@ void devStart(int dev)                          /* Start device `dev' */
    if (devs[dev].busy)                          /* device busy?   */
       return;                                   /*    do nothing. */
 
+   switch (dev) {
+   case DEV_PTR:
+   case DEV_PTP:
+   case DEV_LPT:
+   case DEV_DSK:
+   case DEV_DKP:
+      if (!devs[dev].fd) {                      /* no file assigned? */
+         if (!MissingDev)                       /* no missing devs allowed? */
+            Halt = H_MisDev;                    /*    HALT           */
+         return;
+      }
+      break;
+   default:
+      break;
+   }
+
    if (DEV_CPU == dev)                          /* this is the CPU?  */
       delayION = true;                          /* execute delayed INTEN */
    else {
@@ -273,6 +358,53 @@ void devStart(int dev)                          /* Start device `dev' */
             devs[dev].delay = 1000000 / freq;   /* delay according to freq */
          }
          break;
+      case DEV_LPT:                             /* LPT? */
+         {
+            Flag spacing;
+            Byte pos, ch;
+            PrinterOp  op;
+
+            op = LPT_XMIT; spacing = false;
+            pos = devs[dev].u.LPT.pos++;        /* xmit char buffer to zone */
+            devs[dev].u.LPT.buf[pos] = (ch = 0377 & devs[dev].buf[BUF_A]);
+            switch (ch) {
+            case ASC_CR:
+               op = LPT_CTRL;
+               break;
+            case ASC_LF:                        /* spacing?      */
+               op = LPT_CTRL;
+               devs[dev].u.LPT.lines++;
+               if (0 == pos) {                  /* 1st position? */
+                  devs[dev].delay = 13000;      /* 13ms spacing  */
+                  spacing = true;
+               }
+               else
+                  devs[dev].delay = 20000;      /* 20ms spacing  */
+               break;
+            case ASC_FF:                        /* form feed ?   */
+               op = LPT_CTRL;
+               devs[dev].delay = 13000 * (63 - (devs[dev].u.LPT.lines % 63));
+               devs[dev].u.LPT.lines = 0;       /* reset line counter */
+               break;
+            default:
+               devs[dev].delay = 6;             /* 6us char buf transfer */
+               break;
+            }
+            if (LPT_XMIT == op) {               /* just a xmit?   */
+               Byte lastPos;
+
+               lastPos = LPT_NBUF;
+               if (LPT_NZONE == devs[dev].u.LPT.zone)/* last zone?      */
+                  lastPos >>= 1;                /*    full at half      */
+               lastPos--;
+               if (pos == lastPos)              /* was last position?   */
+                  op = LPT_FULL;                /* change to full       */
+            }
+            if (LPT_XMIT != op && !spacing)     /* print and no spacing?*/
+               devs[dev].delay += 34000;        /*    34ms print time   */
+            devs[dev].u.LPT.op = op;
+         }
+         break;
       }
 
       devs[dev].busy = true;                    /* Busy=1,Done=0 */
@@ -284,6 +416,8 @@ void devStart(int dev)                          /* Start device `dev' */
 
 void devClear(int dev)                          /* Clear device `dev' */ 
 {
+   Device *q;
+
    if (DEV_CPU != dev)                          /* clear buffers */
       devs[dev].buf[BUF_A] = 0;                 /* except CPU buffer A (SW) */
    if (DEV_MDV != dev)
@@ -294,6 +428,17 @@ void devClear(int dev)                          /* Clear device `dev' */
    devs[dev].busy = false;                      /* clear control FFs */
    devs[dev].done = false;
 
+   if (devs[dev].timeout) {                     /* has timeout?   */
+      q = removeQUE(dev);                       /* remove from event QUE */
+      if (NULL == q)                            /* 1st entry? */
+         QUE = devs[dev].que;
+      else
+         q->que = devs[dev].que;                /* remove the entry  */
+
+      devs[dev].timeout = 0;                    /* clear timeout     */
+      devs[dev].que = NULL;                     /* clear queue ptr   */
+   }
+
    if (devs[dev].intreq) {                      /* INT request pending?  */
       devs[dev].intreq = false; IREQ--;         /* clear dev and CPU flag*/
    }
@@ -302,11 +447,52 @@ void devClear(int dev)                          /* Clear device `dev' */
 void devPulse(int dev)                          /* Pulse device `dev' */
 {
    switch (dev) {
+   case DEV_DSK:
+   case DEV_DKP:
+      if (!devs[dev].fd) {                      /* no file assigned? */
+         if (!MissingDev)                       /* no missing devs allowed? */
+            Halt = H_MisDev;                    /*    HALT           */
+         return;
+      }
+      break;
+   default:
+      break;
+   }
+
+   switch (dev) {
    case DEV_MDV:                                /* MDV MUL */
       enqueIO(dev, IOC_PULSE);
       break;
    }
    return;
+}
+
+int readChar(int dev)
+{
+   int ch;
+
+   ASSERT(NULL != devs[dev].fd);
+
+   ch = fgetc(devs[dev].fd);
+   if (EOF == ch) {
+      ch = 0;
+      if (!feof(devs[dev].fd))
+         Halt = H_IOErr;
+   }
+   return ch;
+}
+
+void writeChar(int dev, int ch)
+{
+   char buf[8];
+   int n;
+
+   ASSERT(NULL != devs[dev].fd);
+
+   buf[0] = ch;
+   n = fwrite(buf, sizeof(char), 1, devs[dev].fd);
+   if (1 != n)
+      Halt = H_IOErr;
 }
 
 void devDone(int dev)                           /* Device done, ie timed out */
@@ -316,8 +502,16 @@ void devDone(int dev)                           /* Device done, ie timed out */
    ASSERT(NO_LINE != devs[dev].line);           /* ensure device present */
    ASSERT(NULL == devs[dev].que);               /* removed from event queue */
 
-   if (DEV_MDV != dev) {
-      devs[dev].done = true;                    /* Done=1,Busy=0 */
+   switch (dev) {
+   case DEV_MDV:                                /* MDV has no FFs */
+      break;
+   case DEV_LPT:
+      /* xmit char - does NOT set done, otherwise set done */
+      devs[dev].done = LPT_XMIT == devs[dev].u.LPT.op? false : true;
+      devs[dev].busy = false;
+      break;
+   default:
+      devs[dev].done = true;                    /* Done=1,Busy=0  */
       devs[dev].busy = false;
    }
 
@@ -351,12 +545,44 @@ void devDone(int dev)                           /* Device done, ie timed out */
       }
       break;
    case DEV_TTO:                                /* TTO? */
-      ch = toupper(0377 & devs[dev].buf[BUF_A]);/* write upper case char */
-      printf("%c",ch);
+      ch = 0377 & devs[dev].buf[BUF_A];
+      if (devs[dev].fd)
+         writeChar(dev, ch);
+      printf("%c",toupper(ch));                 /* write upper case char */
       break;
    case DEV_TTI:                                /* TTI? */
-      ch = toupper(0377 & getchar());
-      devs[dev].buf[BUF_A] = ch;                /* read upper case char */
+      if (devs[dev].fd)
+         ch = readChar(dev);
+      else
+         ch = getchar();
+      devs[dev].buf[BUF_A] = toupper(ch);       /* read upper case char */
+      break;
+   case DEV_LPT:
+      {  PrinterOp op;
+         Flag resetZone;
+         int n;
+
+         ASSERT(NULL != devs[dev].fd);        /* ensure file opened */
+
+         resetZone = false;
+         op = devs[dev].u.LPT.op;               /* get printer op */
+         if (LPT_XMIT != op) {                  /* not xmit char buffer? */
+            n = fwrite(&devs[dev].u.LPT.buf[0], /* write zone buffer out */
+                   sizeof(Byte),
+                   devs[dev].u.LPT.pos,
+                   devs[dev].fd);
+            if (n != devs[dev].u.LPT.pos)       /* check chars written */
+               Halt = H_IOErr;                  /*    error if less    */
+            devs[dev].u.LPT.pos = 0;            /* reset position */
+            if (LPT_NZONE == devs[dev].u.LPT.zone || LPT_CTRL == op)
+                                                /* last zone OR CtrlOp? */
+               resetZone = true;                /*    do reset    */
+            else
+               devs[dev].u.LPT.zone++;          /*    next zone   */
+            if (resetZone)
+               devs[dev].u.LPT.zone = 1;        /* reset zone     */
+         }
+      }
       break;
    }
 
@@ -394,10 +620,11 @@ void doIO(int dt)                               /* Do Input/Output   */
       eventTime = ioTime + QUE->timeout;        /*    reset eventTime also */
 }
 
-void initDevs(void)
+void initDevs(int nopts, Option *opts)
 {
-   int i;
+   int i, dev;
    Device *q;
+   Option *opt;
 
    static struct {
       int dev;
@@ -405,11 +632,14 @@ void initDevs(void)
       int delay;
    } inits[] = {
       {DEV_MDV, 16,     7},  /* 6.8us MUL, 7.2us DIV */
-      {DEV_TTI, 14, 100000},
-      {DEV_TTO, 15, 100000},
-      {DEV_PTR, 11,   6667},
-      {DEV_PTP, 11,  15873},
-      {DEV_RTC, 13,  20000},  /* 50Hz */
+      {DEV_TTI, 14, 100000},  /*  10cps */
+      {DEV_TTO, 15, 100000},  /*  10cps */
+      {DEV_PTR, 11,   2500},  /* 400cps */
+      {DEV_PTP, 11,  15873},  /*  63cps */
+      {DEV_RTC, 13,  20000},  /*  50Hz  */
+      {DEV_LPT, 12,  20000},  /* 6us char buf xmit, 20ms/zone print */
+      {DEV_DSK,  9,   2000},  /* 2ms/sector */
+      {DEV_DKP,  7,   2000},
       {DEV_CPU, 16,      0},  /* dummy line */
       {      0,  0,      0}
    };
@@ -423,13 +653,15 @@ void initDevs(void)
       devs[i].timeout = 0;
       devs[i].ctrlfn  = IOC_NONE;
       devs[i].bus = devs[i].que = NULL;
+      devs[i].path   = NULL;
+      devs[i].fd     = NULL;
    }
 
    IREQ = 0;
 
    BUS = NULL;
    for (i = 0; inits[i].dev; i++) {
-      int dev = inits[i].dev;
+      dev = inits[i].dev;
       devs[dev].line  = inits[i].line;
       devs[dev].delay = inits[i].delay;
       devClear(dev);
@@ -448,6 +680,55 @@ void initDevs(void)
          q->bus = &devs[dev];
       }
    }
+
+   for (i = 0; i < nopts; i++) {
+      char *mode = NULL;
+
+      dev = opts[i].dev;
+      opt = &opts[i];
+      if (strcmp(opt->key, "file"))
+         goto ErrOut;
+
+      switch (opt->dev) {
+      case DEV_TTI:
+         mode = "rb";
+         break;
+      case DEV_TTO:
+         mode = "wb";
+         break;
+      case DEV_PTP:
+         mode = "wb";
+         break;
+      case DEV_PTR:
+         mode = "rb";
+         break;
+      case DEV_LPT:
+         mode = "ab";
+         break;
+      case DEV_DSK:
+         mode = "w+b";
+         break;
+      case DEV_DKP:
+         mode = "w+b";
+         break;
+      }
+
+      if (!mode) goto ErrOut;
+      devs[dev].fd = fopen(opt->value,mode);
+      if (NULL == devs[dev].fd) {
+         fprintf(stderr,"%s: cannot open %s!\n",io_devs(opt->dev),opt->value);
+         exit(1);
+      }
+   }
+
+   devs[DEV_LPT].u.LPT.lines = 0;
+   devs[DEV_LPT].u.LPT.op    = LPT_IDLE;
+
+   return;
+
+ErrOut:
+   fprintf(stderr,"%s: unknown option %s!\n",io_devs(opt->dev),opt->key);
+   exit(1);
 
    /* 
       Code  Device   Line
@@ -1000,29 +1281,42 @@ char* mem_indirs[]  = {"", "@"};
 char* mem_acs[]     = {"JMP", "JSR", "ISZ", "DSZ"};
 char* mem_fns[]     = {"jmp", "LDA", "STA", "i/o"};
 
+struct {
+   int code;
+   char *name;
+} devnames[] = {
+   {DEV_MDV, "MDV"},
+   {DEV_TTI, "TTI"},
+   {DEV_TTO, "TTO"},
+   {DEV_PTR, "PTR"},
+   {DEV_PTP, "PTP"},
+   {DEV_RTC, "RTC"},
+   {DEV_LPT, "LPT"},
+   {DEV_DKP, "DKP"},
+   {DEV_CPU, "CPU"},
+   {      0, "NULL"}
+};
+
+int str2dev(char *nm)
+{
+   int i;
+
+   for (i = 0; devnames[i].name; i++) {
+      if (0 == strcmp(devnames[i].name, nm))
+         return devnames[i].code;
+   }
+
+   return 0;
+}
+
 char *io_devs(int dev)
 {
    static char buf[8];
    int i;
-   static struct {
-      int code;
-      char *name;
-   } devs[] = {
-      {DEV_MDV, "MDV"},
-      {DEV_TTI, "TTI"},
-      {DEV_TTO, "TTO"},
-      {DEV_PTR, "PTR"},
-      {DEV_PTP, "PTP"},
-      {DEV_RTC, "RTC"},
-      {DEV_LPT, "LPT"},
-      {DEV_DKP, "DKP"},
-      {DEV_CPU, "CPU"},
-      {      0, "NULL"}
-   };
    
-   for (i = 0; NULL != devs[i].name; i++)
-      if (dev == devs[i].code)
-         return devs[i].name;
+   for (i = 0; NULL != devnames[i].name; i++)
+      if (dev == devnames[i].code)
+         return devnames[i].name;
    sprintf(buf, "%02o", dev);
    return &buf[0];
 }
@@ -1376,9 +1670,6 @@ void strupper(char *s)
    }
 }
 
-#define CR  015
-#define LF  012
-
 void vconsole(void)
 {
    int  i;
@@ -1576,6 +1867,71 @@ if (DBG) fprintf(stderr,"switch cmd = [%s]\n",cmd);
    }
 }
 
+#define MAX_OPTS  64
+
+int parseOpt(char *kv, Option *opt)             /* Parse option: key=value */
+{
+   char *asgn;
+   char tmp[16];
+
+   asgn = strchr(kv,'=');                       /* find equal sign   */
+
+   if ( 0 == asgn) return 1;                    /* no equal? error   */
+   if (kv == asgn) return 2;                    /* no key? error     */
+   if ( 0 == strlen(asgn + 1)) return 3;        /* no value? error   */
+   if (asgn - kv > 15) return 4;                /* key too long? error */
+   opt->value = asgn + 1;                       /* get value         */
+   strncpy(tmp, kv, asgn-kv);                   /* get key           */
+   tmp[asgn-kv] = '\0';
+   opt->key   = strdup(tmp);
+
+   return 0;                                    /* done */
+}
+
+void initOpts(int argc, char *argv[])
+{
+   int i;
+   char buf[8];
+   int dev;
+   int nopts;
+   Option opts[MAX_OPTS];
+   Option opt;
+
+   nopts = 0;
+
+   for (i = 1; i < argc; i++) {
+      char *arg = argv[i];
+      if ('-' != *arg)
+         continue;
+      arg++;
+     
+      if (strlen(arg) < 3) {
+         fprintf(stderr,"%s unknown option!",arg);
+         exit(1);
+      }
+      strncpy(buf,arg,3);
+      buf[3] = '\0'; 
+
+      dev = str2dev(buf);
+      if (0 == dev) {
+         fprintf(stderr,"%s device not found!",buf);
+         exit(1);
+      }
+      if (nopts == MAX_OPTS) {
+         fprintf(stderr,"too many options!");
+         exit(1);
+      }
+      opts[nopts].dev = dev;
+      if (parseOpt(arg + 3, &opts[nopts])) {
+         fprintf(stderr,"%s invalid option!",arg+3);
+         exit(1);
+      }
+      nopts++;
+   }
+
+   initDevs(nopts, &opts[0]);
+}
+
 int main(int argc, char*argv[])
 {
    int i;
@@ -1595,20 +1951,23 @@ int main(int argc, char*argv[])
     * Supernova    800ns
     * Supernova SC 300ns
    */
+
    memTime     = 26; memCycle = false;
    elapsedTime = 0;
    QUE = NULL; ioTime = 0;
+   MissingDev = true;
 
    gettimeofday(&tv0, NULL);
    KIPS = 192;
    numInstr  = 0;
    syncInstr = numInstr + KIPS;
 
+   initOpts(argc, argv);
+
    srandom(1969);
    for (i = 0; i < sizeof(M) / sizeof(Word); i++)
       M[i] = random() & 0177777;
 
-   initDevs();
    Halt = H_Startup;
    vconsole();
 

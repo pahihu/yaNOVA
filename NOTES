@@ -17,6 +17,25 @@ NOTES
 + eventTime is the first absolute time when an event will occur
   should be updated when ioTime changes
 
+LPTfile     printer.txt
+LPTctrl     0 - print when buf full or ctrl received
+            1 - print when ctrl received
+
+PTPfile     punch.pt
+PTRfile     reader.pt
+
+TTIfile     reader.tt
+TTOfile     punch.tt
+
+DSKmodel
+DSKfile
+
+DKPmodel
+DKPfile0
+DKPfile1
+DKPfile2
+DKPfile3
+
 
 - LPT
   printing trigger: buffer full or got CR/LF/FF
