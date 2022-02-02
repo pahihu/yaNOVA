@@ -49,10 +49,17 @@ void doIO(int dt);
 void disasm(Word IR);
 char *io_devs(int dev);
 Word memReadIO(Word adr);
-void memWriteIO(Word adr);
+void memWriteIO(Word adr, Word w);
+
+Word AC[4], PC;                                 /* registers: ACs, PC */
+Flag CRY;                                       /* carry */
+
+Word M[32768];                                  /* memory */
+Byte* B;                                        /* byte addressed memory */
 
 /* --- D E V I C E S -------------------------------------------------------- */
 
+#define SEC_SIZE  512
 #define NDEV      0100
 
 #define DEV_MDV   (001)
@@ -82,6 +89,9 @@ typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
 #define LPT_CHBUF    buf[BUF_A]
 #define DSK_DTS      buf[BUF_A]
 #define DSK_ACNT     buf[BUF_B] 
+#define DSK_E_NODISC 04
+#define DSK_E_WRITE  020
+#define DSK_ERROR    01
 
 typedef struct _Device {
    Byte code;        /* device code */
@@ -96,7 +106,9 @@ typedef struct _Device {
    struct _Device *bus; /* next device on I/O bus */
    struct _Device *que; /* next device on event queue */
    char *path;       /* storage file name */
-   FILE *fd;         /* file handle       */
+   FILE *fd;         /* file handle  */
+   off_t nsecs;      /* num. of sectors */
+   Word *mem;        /* memory image */
    union {
       struct {
          Byte zone;     /* current zone: 1-LPT_NZONE */
@@ -108,7 +120,9 @@ typedef struct _Device {
       struct {
          Word status;   /* status flags      */
          Tyme lastIO;   /* last Start/Pulse  */
+         Tyme lastDOA;  /* last buffer A write  */
          Word lastDTS;  /* last sector       */
+         Byte protect;  /* sector protection */
       } DSK;
       struct {
          Word dummy;
@@ -313,6 +327,10 @@ void devOUT(int dev, int reg, Word w)           /* Device OUTPUT */
          break;
       }
       break;
+   case DEV_DSK:                                /* DSK? */
+      if (BUF_A == reg)
+         devs[dev].u.DSK.lastDOA = elapsedTime;
+      break;
    }
 }
 
@@ -347,6 +365,11 @@ void initDSK(int dev)                           /* Init DSK operation */
 {
    Tyme dt;
 
+   if (sector >= devs[dev].nsecs) {             /* sector off?  */
+      devs[dev].u.DSK.status = DSK_E_NODISC;    /* report NO DRIVE */
+      return;
+   }
+
    devs[dev].u.DSK.status = 0;                  /* clear status */
    devs[dev].delay = 2048;                      /* 256 * 8us    */
 
@@ -362,11 +385,13 @@ void initDSK(int dev)                           /* Init DSK operation */
 
 void doioDSK(int dev)                           /* Perform DSK I/O   */
 {
-   off_t offs;
    Word buf[256];
    int  i;
-   int  nWords;
+   int  n, nWords;
    int  to;
+   unsigned long sector;
+
+   sector = (017777 & devs[dev].DSK_DTS);       /* calc. sector */
 
    nWords = 256;                                /* assume a sector */
    to = devs[dev].timeout / 10;                 /* timeout in us   */
@@ -382,22 +407,19 @@ void doioDSK(int dev)                           /* Perform DSK I/O   */
       for (i = 0; i < nWords; i++)              /* read words     */
          buf[i] = memReadIO(devs[dev].DSK_ACNT + i);/* from memory*/
    }
-   offs = (017777 & devs[dev].DSK_DTS) * 512;   /* calc. phys offset */
-   if (-1 == fseeko(devs[dev].fd, offs, SEEK_SET)) {  /* seek failed? */
-      Halt = H_IOErr;                           /*    HALT        */
-      return;
-   }
    n = nWords;
    switch (devs[dev].ctrlfn) {
    case IOC_NONE:
       break;
    case IOC_START:                              /* do READ */
-      n = fread(buf, sizeof(Word), nWords, devs[dev].fd);
+      for (i = 0; i < nWords; i++)
+         buf[i] = devs[dev].mem[sector + i];
       break;
    case IOC_CLEAR:
       break;
    case IOC_PULSE:                              /* do WRITE */
-      n = fwrite(buf, sizeof(Word), nWords, devs[dev].fd);
+      for (i = 0; i < nWords; i++)
+         devs[dev].mem[sector + i] = buf[i];
       break;
    }
    if (n != nWords) {                           /* partial phys. I/O? */
@@ -463,7 +485,7 @@ void devStart(int dev)                          /* Start device `dev' */
 
             op = LPT_XMIT; spacing = false;
             pos = devs[dev].u.LPT.pos++;        /* xmit char buffer to zone */
-            devs[dev].u.LPT.buf[pos] = (ch = 0377 & devs[dev].LPT_CHBUF;
+            devs[dev].u.LPT.buf[pos] = (ch = 0377 & devs[dev].LPT_CHBUF);
             switch (ch) {
             case ASC_CR:
                op = LPT_CTRL;
@@ -503,6 +525,10 @@ void devStart(int dev)                          /* Start device `dev' */
          }
          break;
       case DEV_DSK:                             /* DSK? */
+         if (usince(devs[dev].u.DSK.lastDOA) < 1000)
+            fprintf(stderr,                     /* check 1ms since last DOA */
+                    "%06o/%06o |DSK Start - DOA| < 1ms!\n",
+                    PC,M[PC]);
          initDSK(dev);                          /* init I/O operation */
          break;
       }
@@ -570,6 +596,9 @@ void devPulse(int dev)                          /* Pulse device `dev' */
    switch (dev) {
    case DEV_MDV:                                /* MDV MUL   */
    case DEV_DSK:                                /* DSK Write */
+      if (usince(devs[dev].u.DSK.lastDOA) < 1000)/* check 1ms since last DOA */
+         fprintf(stderr,"%06o/%06o |DSK Pulse - DOA| < 1ms!\n",
+                  PC,M[PC]);
       enqueIO(dev, IOC_PULSE);
       break;
    }
@@ -732,6 +761,34 @@ void doIO(int dt)                               /* Do Input/Output   */
       eventTime = ioTime + QUE->timeout;        /*    reset eventTime also */
 }
 
+void finish(void)
+{
+   int i;
+   Device *dev;
+
+   if (NULL != devs[DEV_DSK].fd) {
+      long nsecs;
+      dev = &devs[DEV_DSK];
+      if (-1 == fseek(dev->fd, 0, SEEK_SET)) {
+         fprintf(stderr,"fseek(): %s!\n",devs->path);
+         goto LCloseAll;
+      }
+      nsecs = fwrite(dev->mem, SEC_SIZE, dev->nsecs, dev->fd);
+      if (nsecs != dev->nsecs) {
+         fprintf(stderr,"fwrite(): %s!\n",dev->path);
+         goto LCloseAll;
+      }
+   }
+LCloseAll:
+   for (i = 1; i < NDEV; i++) {
+      dev = &devs[i];
+      if (NULL != dev->fd) {
+         if (EOF == fclose(dev->fd))
+            fprintf(stderr,"fclose(): failed to close %s!\n",dev->path);
+      }
+   }
+}
+
 void initDevs(int nopts, Option *opts)
 {
    int i, dev;
@@ -767,6 +824,8 @@ void initDevs(int nopts, Option *opts)
       devs[i].bus = devs[i].que = NULL;
       devs[i].path   = NULL;
       devs[i].fd     = NULL;
+      devs[i].nsecs  = 0;
+      devs[i].mem    = NULL;
    }
 
    IREQ = 0;
@@ -794,10 +853,11 @@ void initDevs(int nopts, Option *opts)
    }
 
    for (i = 0; i < nopts; i++) {
+      Device *dev;
       char *mode = NULL;
 
-      dev = opts[i].dev;
       opt = &opts[i];
+      dev = &devs[opts[i].dev];
       if (strcmp(opt->key, "file"))
          goto ErrOut;
 
@@ -826,10 +886,39 @@ void initDevs(int nopts, Option *opts)
       }
 
       if (!mode) goto ErrOut;
-      devs[dev].fd = fopen(opt->value,mode);
-      if (NULL == devs[dev].fd) {
+      dev->fd = fopen(opt->value,mode);
+      if (NULL == dev->fd) {
          fprintf(stderr,"%s: cannot open %s!\n",io_devs(opt->dev),opt->value);
          exit(1);
+      }
+      if (DEV_DSK == opt->dev || DEV_DKP == opt->dev) {
+         if (-1 == fseek(dev->fd, 0, SEEK_END)) {
+            fprintf(stderr,"fseek(): SEEK_END (%s)\n",opt->value);
+            exit(1);
+         }
+         dev->nsecs = ftello(dev->fd);
+         if ((off_t)-1 == dev->nsecs) {
+            fprintf(stderr,"ftello(): %s!\n",opt->value);
+            exit(1);
+         }
+         dev->nsecs = dev->nsecs / SEC_SIZE;
+         if (-1 == fseek(dev->fd, 0, SEEK_SET)) {
+            fprintf(stderr,"fseek(): SEEK_SET (%s)!\n",opt->value);
+            exit(1);
+         }
+      }
+      if (DEV_DSK == opt->dev) {
+         long nsecs;
+         dev->mem = (Word*)malloc(dev->nsecs * SEC_SIZE);
+         if (NULL == dev->mem) {
+            fprintf(stderr,"malloc(): not enough memory (%s)!\n",opt->value);
+            exit(1);
+         }
+         nsecs = fread(dev->mem, SEC_SIZE, dev->nsecs, dev->fd);
+         if (nsecs != dev->nsecs) {
+            fprintf(stderr,"fdread(): %s!\n",opt->value);
+            exit(1);
+         }
       }
    }
 
@@ -837,7 +926,10 @@ void initDevs(int nopts, Option *opts)
    devs[DEV_LPT].u.LPT.op    = LPT_IDLE;
 
    devs[DEV_DSK].u.DSK.lastIO  = 0;
+   devs[DEV_DSK].u.DSK.lastDOA = 0;
    devs[DEV_DSK].u.DSK.lastDTS = 0;
+
+   atexit(finish);
 
    return;
 
@@ -874,9 +966,6 @@ ErrOut:
 
 /* --- M E M O R Y ---------------------------------------------------------- */
 
-Word M[32768];    /* memory */
-unsigned char* B;
-
 void cycle(void)
 {
    struct timespec dork, unslept;
@@ -906,7 +995,7 @@ Word memReadIO(Word adr)
    return M[077777 & adr];
 }
 
-Word memWriteIO(Word adr, Word w)
+void memWriteIO(Word adr, Word w)
 {
    /* I/O memory write, when time already lapsed ! */
    M[077777 & adr] = w;
@@ -932,9 +1021,6 @@ Word memReadIndir(Word adr)
 }
 
 /* --- P R O C E S S O R ---------------------------------------------------- */
-
-Word AC[4], PC;
-Flag CRY;
 
 #define SW     (devs[DEV_CPU].buf[BUF_A])
 #define ION    (devs[DEV_CPU].busy)
@@ -2022,7 +2108,6 @@ void initOpts(int argc, char *argv[])
    int dev;
    int nopts;
    Option opts[MAX_OPTS];
-   Option opt;
 
    nopts = 0;
 
