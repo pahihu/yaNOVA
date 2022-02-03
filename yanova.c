@@ -91,7 +91,11 @@ typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
 #define DSK_ACNT     buf[BUF_B] 
 #define DSK_E_NODISC 04
 #define DSK_E_WRITE  020
-#define DSK_ERROR    01
+#define DSK_E_ERROR  01
+
+#define DKP_CYL      buf[BUF_A]
+#define DKP_ACNT     buf[BUF_B]
+#define DKP_DSS      buf[BUF_C]
 
 typedef struct _Device {
    Byte code;        /* device code */
@@ -105,9 +109,9 @@ typedef struct _Device {
    CtrlFn ctrlfn;    /* control function, which started the operation */
    struct _Device *bus; /* next device on I/O bus */
    struct _Device *que; /* next device on event queue */
-   char *path;       /* storage file name */
-   FILE *fd;         /* file handle  */
-   off_t nsecs;      /* num. of sectors */
+   char *path[4];    /* storage file names */
+   FILE *fd[4];      /* file handles */
+   off_t nsecs[4];   /* num. of sectors/drive */
    Word *mem;        /* memory image */
    union {
       struct {
@@ -122,10 +126,11 @@ typedef struct _Device {
          Tyme lastIO;   /* last Start/Pulse  */
          Tyme lastDOA;  /* last buffer A write  */
          Word lastDTS;  /* last sector       */
-         Byte protect;  /* sector protection */
+         Byte protect;  /* track protection (1bit for 16 tracks) */
       } DSK;
       struct {
-         Word dummy;
+         Word status;   /* status flags      */
+         Flag shared;   /* shared disks, use locking */
       } DKP;
    } u;
 } Device;
@@ -280,18 +285,18 @@ Word devIN(int dev, int reg)                    /* Device INPUT */
       break;
    case DEV_LPT:                                /* --- LPT ------- */
       if (BUF_A == reg)                         /* read status     */
-         w = NULL == devs[dev].fd? 0 : 1;       /* printer online? */
+         w = NULL == devs[dev].fd[0]? 0 : 1;    /* printer online? */
       break;
    case DEV_DSK:
       switch (reg) {
       case BUF_A:
-         /* XXX status */
+         w = devs[dev].u.DSK.status;            /* DSK status reg */
          break;
       case BUF_B:
          break;
       case BUF_C:
          if (devs[dev].DSK_DTS & 0100000)
-            fprintf(stderr,"%06o %06o Disc Maintenance!\n",PC,M[PC]);
+            fprintf(stderr,"%06o/%06o Disc Maintenance!\n",PC,M[PC]);
          break;
       }
    }
@@ -330,6 +335,8 @@ void devOUT(int dev, int reg, Word w)           /* Device OUTPUT */
    case DEV_DSK:                                /* DSK? */
       if (BUF_A == reg)
          devs[dev].u.DSK.lastDOA = elapsedTime;
+      if (BUF_B == reg && (0100000 & w))        /* check diag mode */
+         fprintf(stderr,"%06o / %06o DSK Diagnostic Mode!\n",PC,M[PC]);
       break;
    }
 }
@@ -364,13 +371,24 @@ void enqueIO(int dev, CtrlFn fn)                /* Enqueue I/O operation */
 void initDSK(int dev)                           /* Init DSK operation */
 {
    Tyme dt;
-
-   if (sector >= devs[dev].nsecs) {             /* sector off?  */
-      devs[dev].u.DSK.status = DSK_E_NODISC;    /* report NO DRIVE */
-      return;
-   }
+   Word sector, track;
 
    devs[dev].u.DSK.status = 0;                  /* clear status */
+
+   sector = 017777 & devs[dev].DSK_DTS;         /* calc sector    */
+   if (sector >= devs[dev].nsecs[0])            /* sector off?    */
+      devs[dev].u.DSK.status |= DSK_E_NODISC;   /* report NO DISC */
+
+   track = 0177 & (sector >> 3);                /* calc track  */
+   if (devs[dev].u.DSK.protect & (1 << (track >> 4)))/* track protected?  */
+      devs[dev].u.DSK.status |= DSK_E_WRITE;    /* report WRITE ERROR */
+
+   if (devs[dev].u.DSK.status) {                /* any error?     */
+      devs[dev].u.DSK.status |= DSK_E_ERROR;    /* set ERROR flag */
+      devs[dev].delay = 8;                      /* report ERROR   */
+      goto Exit;                                /* done           */
+   }
+
    devs[dev].delay = 2048;                      /* 256 * 8us    */
 
    dt = usince(devs[dev].u.DSK.lastIO);         /* elapsed time since last I/O*/
@@ -380,7 +398,9 @@ void initDSK(int dev)                           /* Init DSK operation */
                    - devs[dev].u.DSK.lastDTS) { /* next sector? */
       devs[dev].delay += 2048 - dt;             /* wait until we got there */
    }
+Exit:
    devs[dev].u.DSK.lastIO = elapsedTime;        /* save current time  */
+   return;
 }
 
 void doioDSK(int dev)                           /* Perform DSK I/O   */
@@ -439,19 +459,24 @@ LExit:
 
 void devStart(int dev)                          /* Start device `dev' */
 {
+   int drv;
+
    if (NO_LINE == devs[dev].line)               /* no such device */
       return;                                   /*    do nothing  */
 
    if (devs[dev].busy)                          /* device busy?   */
       return;                                   /*    do nothing. */
 
+   drv = 0;
    switch (dev) {
    case DEV_PTR:
    case DEV_PTP:
    case DEV_LPT:
    case DEV_DSK:
    case DEV_DKP:
-      if (!devs[dev].fd) {                      /* no file assigned? */
+      if (DEV_DKP == dev)                       /* calc. drive for DKP */
+         drv = devs[dev].DKP_DSS >> 14;
+      if (!devs[dev].fd[drv]) {                 /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
             Halt = H_MisDev;                    /*    HALT           */
          return;
@@ -577,10 +602,15 @@ void devClear(int dev)                          /* Clear device `dev' */
 
 void devPulse(int dev)                          /* Pulse device `dev' */
 {
+   int drv;
+
+   drv = 0;
    switch (dev) {
    case DEV_DSK:
    case DEV_DKP:
-      if (!devs[dev].fd) {                      /* no file assigned? */
+      if (DEV_DKP == dev)                       /* calc. drive for DKP */
+         drv = devs[dev].DKP_DSS >> 14;
+      if (!devs[dev].fd[drv]) {                 /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
             Halt = H_MisDev;                    /*    HALT           */
          return;
@@ -609,12 +639,12 @@ int readChar(int dev)
 {
    int ch;
 
-   ASSERT(NULL != devs[dev].fd);
+   ASSERT(NULL != devs[dev].fd[0]);
 
-   ch = fgetc(devs[dev].fd);
+   ch = fgetc(devs[dev].fd[0]);
    if (EOF == ch) {
       ch = 0;
-      if (!feof(devs[dev].fd))
+      if (!feof(devs[dev].fd[0]))
          Halt = H_IOErr;
    }
    return ch;
@@ -625,10 +655,10 @@ void writeChar(int dev, int ch)
    char buf[8];
    int n;
 
-   ASSERT(NULL != devs[dev].fd);
+   ASSERT(NULL != devs[dev].fd[0]);
 
    buf[0] = ch;
-   n = fwrite(buf, sizeof(char), 1, devs[dev].fd);
+   n = fwrite(buf, sizeof(char), 1, devs[dev].fd[0]);
    if (1 != n)
       Halt = H_IOErr;
 }
@@ -684,12 +714,12 @@ void devDone(int dev)                           /* Device done, ie timed out */
       break;
    case DEV_TTO:                                /* TTO? */
       ch = 0377 & devs[dev].buf[BUF_A];
-      if (devs[dev].fd)
+      if (devs[dev].fd[0])
          writeChar(dev, ch);
       printf("%c",toupper(ch));                 /* write upper case char */
       break;
    case DEV_TTI:                                /* TTI? */
-      if (devs[dev].fd)
+      if (devs[dev].fd[0])
          ch = readChar(dev);
       else
          ch = getchar();
@@ -700,7 +730,7 @@ void devDone(int dev)                           /* Device done, ie timed out */
          Flag resetZone;
          int n;
 
-         ASSERT(NULL != devs[dev].fd);        /* ensure file opened */
+         ASSERT(NULL != devs[dev].fd[0]);       /* ensure file opened */
 
          resetZone = false;
          op = devs[dev].u.LPT.op;               /* get printer op */
@@ -708,7 +738,7 @@ void devDone(int dev)                           /* Device done, ie timed out */
             n = fwrite(&devs[dev].u.LPT.buf[0], /* write zone buffer out */
                    sizeof(Byte),
                    devs[dev].u.LPT.pos,
-                   devs[dev].fd);
+                   devs[dev].fd[0]);
             if (n != devs[dev].u.LPT.pos)       /* check chars written */
                Halt = H_IOErr;                  /*    error if less    */
             devs[dev].u.LPT.pos = 0;            /* reset position */
@@ -723,7 +753,8 @@ void devDone(int dev)                           /* Device done, ie timed out */
       }
       break;
    case DEV_DSK:                                /* DSK? */
-      doioDSK(dev);                             /* perform I/O */
+      if (0 == devs[dev].u.DSK.status)          /* if no ERROR */
+         doioDSK(dev);                          /*    perform I/O */
       break;
    }
 
@@ -763,35 +794,36 @@ void doIO(int dt)                               /* Do Input/Output   */
 
 void finish(void)
 {
-   int i;
+   int i, drv;
    Device *dev;
 
-   if (NULL != devs[DEV_DSK].fd) {
+   if (NULL != devs[DEV_DSK].fd[0]) {
       long nsecs;
       dev = &devs[DEV_DSK];
-      if (-1 == fseek(dev->fd, 0, SEEK_SET)) {
-         fprintf(stderr,"fseek(): %s!\n",devs->path);
+      if (-1 == fseek(dev->fd[0], 0, SEEK_SET)) {
+         fprintf(stderr,"fseek(): %s!\n",devs->path[0]);
          goto LCloseAll;
       }
-      nsecs = fwrite(dev->mem, SEC_SIZE, dev->nsecs, dev->fd);
-      if (nsecs != dev->nsecs) {
-         fprintf(stderr,"fwrite(): %s!\n",dev->path);
+      nsecs = fwrite(dev->mem, SEC_SIZE, dev->nsecs[0], dev->fd[0]);
+      if (nsecs != dev->nsecs[0]) {
+         fprintf(stderr,"fwrite(): %s!\n",dev->path[0]);
          goto LCloseAll;
       }
    }
 LCloseAll:
    for (i = 1; i < NDEV; i++) {
       dev = &devs[i];
-      if (NULL != dev->fd) {
-         if (EOF == fclose(dev->fd))
-            fprintf(stderr,"fclose(): failed to close %s!\n",dev->path);
-      }
+      for (drv = 0; drv < 4; drv++)
+         if (NULL != dev->fd[drv]) {
+            if (EOF == fclose(dev->fd[drv]))
+               fprintf(stderr,"fclose(): failed to close %s!\n",dev->path[drv]);
+         }
    }
 }
 
 void initDevs(int nopts, Option *opts)
 {
-   int i, dev;
+   int i, dev, drv;
    Device *q;
    Option *opt;
 
@@ -807,7 +839,7 @@ void initDevs(int nopts, Option *opts)
       {DEV_PTP, 11,  15873},  /*  63cps */
       {DEV_RTC, 13,  20000},  /*  50Hz  */
       {DEV_LPT, 12,  20000},  /* 6us char buf xmit, 20ms/zone print */
-      {DEV_DSK,  9,   2000},  /* 2ms/sector */
+      {DEV_DSK,  9,   2048},  /* 2048us/sector */
       {DEV_DKP,  7,   2000},
       {DEV_CPU, 16,      0},  /* dummy line */
       {      0,  0,      0}
@@ -822,9 +854,11 @@ void initDevs(int nopts, Option *opts)
       devs[i].timeout = 0;
       devs[i].ctrlfn  = IOC_NONE;
       devs[i].bus = devs[i].que = NULL;
-      devs[i].path   = NULL;
-      devs[i].fd     = NULL;
-      devs[i].nsecs  = 0;
+      for (drv = 0; drv < 4; drv++) {
+         devs[i].path[drv]  = NULL;
+         devs[i].fd[drv]    = NULL;
+         devs[i].nsecs[drv] = 0;
+      }
       devs[i].mem    = NULL;
    }
 
@@ -858,68 +892,93 @@ void initDevs(int nopts, Option *opts)
 
       opt = &opts[i];
       dev = &devs[opts[i].dev];
-      if (strcmp(opt->key, "file"))
-         goto ErrOut;
-
-      switch (opt->dev) {
-      case DEV_TTI:
-         mode = "rb";
-         break;
-      case DEV_TTO:
-         mode = "wb";
-         break;
-      case DEV_PTP:
-         mode = "wb";
-         break;
-      case DEV_PTR:
-         mode = "rb";
-         break;
-      case DEV_LPT:
-         mode = "ab";
-         break;
-      case DEV_DSK:
-         mode = "w+b";
-         break;
-      case DEV_DKP:
-         mode = "w+b";
-         break;
+      if (0 == strncmp(opt->key, "file", 4)) {  /* storage file   */
+         char *tmp = opt->key + 4;              /* skip "file"    */
+         int drv = 0;                           /* assume drive 0 */
+         if (*tmp)                              /* any chars after "file"? */
+            drv = atoi(tmp);                    /* convert to int */
+         switch (opt->dev) {
+         case DEV_TTI:
+            if (drv) goto ErrOut;
+            mode = "rb"; break;
+         case DEV_TTO:
+            if (drv) goto ErrOut;
+            mode = "wb"; break;
+         case DEV_PTP:
+            if (drv) goto ErrOut;
+            mode = "wb"; break;
+         case DEV_PTR:
+            if (drv) goto ErrOut;
+            mode = "rb"; break;
+         case DEV_LPT:
+            if (drv) goto ErrOut;
+            mode = "ab"; break;
+         case DEV_DSK:
+            if (drv) goto ErrOut;               /* drive comes from size */
+            mode = "w+b"; break;
+         case DEV_DKP:
+            if (drv > 3) goto ErrOut;           /* max 4 drives */
+            mode = "w+b"; break;
+         default: break;
+         }
+         if (!mode) goto ErrOut;
+         dev->fd[drv] = fopen(opt->value,mode);
+         if (NULL == dev->fd[drv]) {
+            fprintf(stderr,"%s: cannot open %s!\n",io_devs(opt->dev),opt->value);
+            exit(1);
+         }
+         dev->path[drv] = opt->value;
+         if (DEV_DSK == opt->dev || DEV_DKP == opt->dev) {
+            off_t nsecs;
+            if (-1 == fseek(dev->fd[drv], 0, SEEK_END)) {
+               fprintf(stderr,"fseek(): SEEK_END (%s)\n",opt->value);
+               exit(1);
+            }
+            nsecs = ftello(dev->fd[drv]);
+            if ((off_t)-1 == nsecs) {
+               fprintf(stderr,"ftello(): %s!\n",opt->value);
+               exit(1);
+            }
+            nsecs = nsecs / SEC_SIZE;
+            if (DEV_DSK == opt->dev) {
+               if (nsecs < 256 || nsecs > 65536) {
+                  fprintf(stderr,"%s: invalid size [64K - 2048K]!\n",opt->value);
+                  exit(1);
+               }
+            }
+            dev->nsecs[drv] = nsecs;
+            if (-1 == fseek(dev->fd[drv], 0, SEEK_SET)) {
+               fprintf(stderr,"fseek(): SEEK_SET (%s)!\n",opt->value);
+               exit(1);
+            }
+         }
+         if (DEV_DSK == dev->code) {
+            long nsecs;
+            dev->mem = (Word*)malloc(dev->nsecs[drv] * SEC_SIZE);
+            if (NULL == dev->mem) {
+               fprintf(stderr,"malloc(): not enough memory (%s)!\n",opt->value);
+               exit(1);
+            }
+            nsecs = fread(dev->mem, SEC_SIZE, dev->nsecs[drv], dev->fd[drv]);
+            if (nsecs != dev->nsecs[drv]) {
+               fprintf(stderr,"fdread(): %s!\n",opt->value);
+               exit(1);
+            }
+         }
       }
-
-      if (!mode) goto ErrOut;
-      dev->fd = fopen(opt->value,mode);
-      if (NULL == dev->fd) {
-         fprintf(stderr,"%s: cannot open %s!\n",io_devs(opt->dev),opt->value);
-         exit(1);
-      }
-      if (DEV_DSK == opt->dev || DEV_DKP == opt->dev) {
-         if (-1 == fseek(dev->fd, 0, SEEK_END)) {
-            fprintf(stderr,"fseek(): SEEK_END (%s)\n",opt->value);
-            exit(1);
-         }
-         dev->nsecs = ftello(dev->fd);
-         if ((off_t)-1 == dev->nsecs) {
-            fprintf(stderr,"ftello(): %s!\n",opt->value);
-            exit(1);
-         }
-         dev->nsecs = dev->nsecs / SEC_SIZE;
-         if (-1 == fseek(dev->fd, 0, SEEK_SET)) {
-            fprintf(stderr,"fseek(): SEEK_SET (%s)!\n",opt->value);
-            exit(1);
+      else if (0 == strcmp(opt->key, "protect")) {
+         if (DEV_DSK == dev->code) {
+            dev->u.DSK.protect = atoi(opt->value);
+            continue;
          }
       }
-      if (DEV_DSK == opt->dev) {
-         long nsecs;
-         dev->mem = (Word*)malloc(dev->nsecs * SEC_SIZE);
-         if (NULL == dev->mem) {
-            fprintf(stderr,"malloc(): not enough memory (%s)!\n",opt->value);
-            exit(1);
-         }
-         nsecs = fread(dev->mem, SEC_SIZE, dev->nsecs, dev->fd);
-         if (nsecs != dev->nsecs) {
-            fprintf(stderr,"fdread(): %s!\n",opt->value);
-            exit(1);
+      else if (0 == strcmp(opt->key, "shared")) {
+         if (DEV_DKP == dev->code) {
+            dev->u.DKP.shared = atoi(opt->value)? true : false;
+            continue;
          }
       }
+      goto ErrOut;
    }
 
    devs[DEV_LPT].u.LPT.lines = 0;
@@ -1505,6 +1564,7 @@ struct {
    {DEV_PTP, "PTP"},
    {DEV_RTC, "RTC"},
    {DEV_LPT, "LPT"},
+   {DEV_DSK, "DSK"},
    {DEV_DKP, "DKP"},
    {DEV_CPU, "CPU"},
    {      0, "NULL"}
