@@ -13,8 +13,10 @@ int DBG=0;
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 #include <string.h>
 #include <time.h>                               /* nanosleep()    */
+#include <sys/file.h>                           /* flock()        */
 #include <sys/time.h>                           /* gettimeofday() */
 #include <unistd.h>                             /* usleep()       */
 
@@ -110,11 +112,13 @@ typedef struct _Device {
    struct _Device *bus; /* next device on I/O bus */
    struct _Device *que; /* next device on event queue */
    struct {
-      char *path;    /* storage file names */
-      FILE *fd;      /* file handles */
+      char  *path;   /* storage file names */
+      FILE  *fd;     /* file handles */
       off_t nsecs;   /* num. of sectors/drive */
       Flag  rdonly;  /* read-only drives */
    } units[4];
+   Flag shared;      /* shared drive, use locking */
+   Flag locked;      /* signals drive locked      */
    Word *mem;        /* memory image   */
    union {
       struct {
@@ -133,7 +137,6 @@ typedef struct _Device {
       } DSK;
       struct {
          Word status;   /* status flags      */
-         Flag shared;   /* shared disks, use locking */
       } DKP;
    } u;
 } Device;
@@ -375,10 +378,54 @@ void enqueIO(Device *dev, CtrlFn fn)            /* Enqueue I/O operation */
    eventTime = ioTime + QUE->timeout;           /*    and eventTime */
 }
 
-void initDSK(Device *dev)                       /* Init DSK operation */
+int lockDEV(Device *dev)
+{
+   int rc;
+
+   /* NB. always lock unit0, because the controller is locked!    */
+
+   ASSERT(NULL != dev->units[0].fd);            /* ensure fd      */
+
+   if (dev->shared) {                           /* shared disk?   */
+      ASSERT(false == dev->locked);             /* ensure unlcked */
+      rc = flock(fileno(dev->units[0].fd),      /* try to lock    */
+                  LOCK_EX | LOCK_NB);
+      if (-1 == rc) {                           /* failed?        */
+         if (EWOULDBLOCK == rc)                 /*    another proc uses it! */
+            return -1;
+         else {
+            Halt = H_IOErr;                     /* other I/O error*/
+            return 1;                           /*    HALT        */
+         }
+      }
+      dev->locked = true;                       /* mark locked    */
+   }
+   return 0;
+}
+
+void unlockDEV(Device *dev)
+{
+   int rc;
+
+   /* NB. always lock unit0, because the controller is locked!    */
+
+   ASSERT(NULL != dev->units[0].fd);            /* ensure fd      */
+
+   if (dev->shared) {                           /* shared disk?      */
+      ASSERT(dev->locked);                      /*    ensure locked  */
+      dev->locked = false;                      /*    clear locked   */
+      rc = flock(fileno(dev->units[0].fd),      /*    unlock it      */
+                           LOCK_UN);
+      if (-1 == rc)                             /* I/O error?  */
+         Halt = H_IOErr;                        /*    HALT     */
+   }
+}
+
+int initDSK(Device *dev)                        /* Init DSK operation */
 {
    Tyme dt;
    Word sector, track;
+   int  rc;
 
    dev->u.DSK.status = 0;                       /* clear status */
 
@@ -390,17 +437,30 @@ void initDSK(Device *dev)                       /* Init DSK operation */
    if (dev->u.DSK.protect & (1 << (track >> 4)))/* track protected?  */
       dev->u.DSK.status |= DSK_E_WRITE;         /* report WRITE ERROR */
 
+ErrOut:
    if (dev->u.DSK.status) {                     /* any error?     */
       dev->u.DSK.status |= DSK_E_ERROR;         /* set ERROR flag */
-      dev->delay = 8;                           /* report ERROR   */
+      dev->delay = 3 * memTime / 10;            /* report ERROR   */
       goto Exit;                                /* done           */
+   }
+
+   if ((rc = lockDEV(dev))) {                   /* lock drive     */
+      if (Halt)                                 /* something failed? */
+         return rc;                             /*    just return */
+      dev->u.DSK.status |= DSK_E_NODISC;        /* report NO DISC */
+      goto ErrOut;                              /*    return      */
    }
 
    dev->delay = 2084;                           /* actual xfer: 256 * 8us */
 
+   if (dev->shared) {                           /* shared drive?  */
+      dev->u.DSK.lastIO = 0;                    /* clear last I/O time */
+                                                /* calc w/ half rev.   */
+   }
+
    dt = usince(dev->u.DSK.lastIO);              /* elapsed time since last I/O*/
    if (dt > 2084) {                             /* more than 2084us?    */
-      dev->delay += 8400;                       /* avg rotational delay */
+      dev->delay += 8334;                       /* avg rotational delay */
    } else if (1 == dev->DSK_DTS 
                    - dev->u.DSK.lastDTS) {      /* next sector? */
       dev->delay += 2084 - dt;                  /* wait until we got there */
@@ -409,7 +469,7 @@ void initDSK(Device *dev)                       /* Init DSK operation */
    }
 Exit:
    dev->u.DSK.lastIO = elapsedTime;             /* save current time  */
-   return;
+   return 0;
 }
 
 void doioDSK(Device *dev)                       /* Perform DSK I/O   */
@@ -564,7 +624,8 @@ void devStart(int devno)                        /* Start device `dev' */
             fprintf(stderr,                     /* check 1ms since last DOA */
                     "%06o/%06o |DSK Start - DOA| < 1ms!\n",
                     PC,M[PC]);
-         initDSK(dev);                          /* init I/O operation */
+         if (initDSK(dev))                      /* init I/O operation */
+            return;                             /* failed, return     */
          break;
       }
 
@@ -581,7 +642,12 @@ void devClear(int devno)                        /* Clear device `dev' */
 
    dev = &devs[devno];
    if (DEV_DSK == devno) {                      /* DSK?  */
-      doioDSK(dev);                             /* do PARTIAL I/O */
+      if (dev->busy) {                          /* I/O was in progress? */
+         if (0 == dev->u.DSK.status) {          /* disk status clear?   */
+            doioDSK(dev);                       /*    do PARTIAL I/O    */
+            unlockDEV(dev);                     /*    unlock it         */
+         }
+      }
       dev->u.DSK.status = 0;                    /* clear status   */
    }
 
@@ -638,8 +704,10 @@ void devPulse(int devno)                        /* Pulse device `dev' */
       break;
    }
 
-   if (DEV_DSK == devno)                        /* DSK? */
-      initDSK(dev);                             /* init I/O operation */
+   if (DEV_DSK == devno) {                      /* DSK? */
+      if (initDSK(dev))                         /* init I/O operation */
+         return;                                /* failed, return     */
+   }
 
    switch (devno) {
    case DEV_MDV:                                /* MDV MUL   */
@@ -771,8 +839,10 @@ void devDone(Device *dev)                       /* Device done, ie timed out */
       }
       break;
    case DEV_DSK:                                /* DSK? */
-      if (0 == dev->u.DSK.status)               /* if no ERROR */
+      if (0 == dev->u.DSK.status) {             /* if no ERROR */
          doioDSK(dev);                          /*    perform I/O */
+         unlockDEV(dev);                        /*    unlock it   */
+      }
       break;
    }
 
@@ -898,6 +968,8 @@ void initDevs(int nopts, Option *opts)
          dev->units[drv].rdonly=false;
       }
       dev->mem    = NULL;
+      dev->shared = false;
+      dev->locked = false;
    }
 
    IREQ = 0;
@@ -1012,8 +1084,8 @@ void initDevs(int nopts, Option *opts)
          }
       }
       else if (0 == strcmp(opt->key, "shared")) {
-         if (DEV_DKP == devno) {
-            dev->u.DKP.shared = atoi(opt->value)? true : false;
+         if (DEV_DSK == devno || DEV_DKP == devno) {
+            dev->shared = atoi(opt->value)? true : false;
             continue;
          }
       }
@@ -1028,9 +1100,6 @@ void initDevs(int nopts, Option *opts)
    dev->u.DSK.lastIO  = 0;
    dev->u.DSK.lastDOA = 0;
    dev->u.DSK.lastDTS = 0;
-
-   dev = &devs[DEV_DKP];
-   dev->u.DKP.shared = false;
 
    atexit(finish);
 
