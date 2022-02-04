@@ -26,6 +26,8 @@ typedef unsigned int DWord;
 typedef enum{false,true} Flag;                  /* Boolean */
 typedef unsigned long Tyme;                     /* time measured in 0.1us */
 
+#define FOREVER   ((((unsigned int)-1) >> 1) / 10)
+
 
 #define ABS(x)    ((x)<0? -(x):(x))
 
@@ -39,17 +41,17 @@ void Assert(char *path,int lno, char *msg, int cond)
 #define ASSERT(cond) Assert(__FILE__,__LINE__,""#cond,cond)
 
 typedef struct _Option {
-   Byte dev;
+   Byte devno;
    char *key;
    char *value;
 } Option;
 
-void devClear(int dev);                         /* Forward declarations */
-void devStart(int dev);
-void devPulse(int dev);
+void devClear(Byte devno);                      /* Forward declarations */
+void devStart(Byte devno);
+void devPulse(Byte devno);
 void doIO(int dt);
 void disasm(Word IR);
-char *io_devs(int dev);
+char *io_devs(Byte devno);
 Word memReadIO(Word adr);
 void memWriteIO(Word adr, Word w);
 
@@ -89,15 +91,59 @@ typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
 #define LPT_NBUF     24
 #define LPT_NZONE     6
 #define LPT_CHBUF    buf[BUF_A]
+
 #define DSK_DTS      buf[BUF_A]
 #define DSK_ACNT     buf[BUF_B] 
 #define DSK_E_NODISC 04
 #define DSK_E_WRITE  020
 #define DSK_E_ERROR  01
 
-#define DKP_CYL      buf[BUF_A]
+#define DKP_DMC      buf[BUF_A]
 #define DKP_ACNT     buf[BUF_B]
 #define DKP_DSS      buf[BUF_C]
+#define DKP_NSEC     4872
+
+#define DKP_DRV(x)   ((x) >> 14)
+#define DKP_HED(x)   (((x) >> 8) & 01)
+#define DKP_SEC(x)   (((x) >> 4) & 017)
+#define DKP_SCNT(x)  ((x) & 017)
+
+#define DKP_MOD(x)   (((x) >> 8) & 03)
+#define DKP_CYL(x)   ((x) & 0377)
+
+/* status flags */
+#define DKP_DONE_RW       0100000
+#define DKP_DONE_SEEK0    0040000
+#define DKP_DONE_SEEK1    0020000
+#define DKP_DONE_SEEK2    0010000
+#define DKP_DONE_SEEK3    0004000
+
+#define DKP_DONE_SEEK(u)  (1 << ((u) + 12))
+
+#define DKP_SEEKING0 0002000
+#define DKP_SEEKING1 0001000
+#define DKP_SEEKING2 0000400
+#define DKP_SEEKING3 0000200
+
+#define DKP_SEEKING(u)  (1 << ((u) + 7))
+
+#define DKP_RDY      0000100
+#define DKP_E_SEEK   0000040
+#define DKP_E_END    0000020
+#define DKP_E_UNSAFE 0000010
+#define DKP_E_CHK    0000004
+#define DKP_E_LATE   0000002
+#define DKP_E_ERROR  0000001
+
+/* mode */
+#define DKP_MREAD    0
+#define DKP_MWRITE   1
+#define DKP_MSEEK    2
+#define DKP_MRECAL   3
+
+#define DKP_GEO_CC   203
+#define DKP_GEO_HH     2
+#define DKP_GEO_SS    12
 
 typedef struct _Event {
    Byte devno;       /* device number */
@@ -111,7 +157,7 @@ typedef struct _Event {
 Event events[NEVENT];
 
 typedef struct _Device {
-   Byte code;        /* device code */
+   Byte devno;        /* device code */
    Word buf[3];
    Flag busy, done;  /* device status: 00 - idle, 10 - working, 01 - done */
    Flag intdis;      /* INT disable flag */
@@ -121,12 +167,17 @@ typedef struct _Device {
    struct _Device *bus; /* next device on I/O bus */
    struct {
       char  *path;   /* storage file names */
-      FILE  *fd;     /* file handles */
+      FILE  *fd;     /* file handles       */
       off_t nsecs;   /* num. of sectors/drive */
-      Flag  rdonly;  /* read-only drives */
+      Flag  rdonly;  /* read-only drives   */
+      Word  buf[3];  /* saved regs at Start/Pulse */
+      Tyme  lastRW;  /* last R/W time, Seek/Recalibrate clears it */
+      Word  lastSEC; /* last sector R/W on a surface */
    } units[4];
+   Word status;      /* controller status  */
    Flag shared;      /* shared drive, use locking */
    Flag locked;      /* signals drive locked      */
+   Tyme unlockTO;    /* unlock timeout for locked devs */
    Word *mem;        /* memory image   */
    union {
       struct {
@@ -137,14 +188,13 @@ typedef struct _Device {
          PrinterOp op;  /* LPT operation */
       } LPT;
       struct {
-         Word status;   /* status flags      */
          Tyme lastIO;   /* last Start/Pulse  */
          Tyme lastDOA;  /* last buffer A write  */
          Word lastDTS;  /* last sector       */
          Byte protect;  /* track protection (1bit for 16 tracks) */
       } DSK;
       struct {
-         Word status;   /* status flags      */
+         Word dummy;
       } DKP;
    } u;
 } Device;
@@ -258,7 +308,7 @@ Event* insertQUE(int t)
 }
 
 /* return pointer to previous device in the queue */
-Event* removeQUE(int devno)
+Event* removeQUE(Byte devno)
 {
    Event *p, *q;
 
@@ -282,7 +332,7 @@ void IORST(void)                                /* IORST */
 
    q = BUS;                                     /* clear ctrl FFs in all devs */
    while (q) {
-      devClear(q->code);                        /* Clear dev (intreq cleared) */
+      devClear(q->devno);                       /* Clear dev (intreq cleared) */
       q->intdis = false;                        /* clear IntDisable */
       q = q->bus;                               /* next device on BUS */
    }
@@ -292,7 +342,7 @@ void IORST(void)                                /* IORST */
    QUE = NULL;
 }
 
-Word devIN(int devno, int reg)                  /* Device INPUT */
+Word devIN(Byte devno, int reg)                 /* Device INPUT */
 {
    Word w;
    Device *q, *dev;
@@ -313,7 +363,7 @@ Word devIN(int devno, int reg)                  /* Device INPUT */
                 * it remains on the bus until the program clears Done or
                 * sets Interrupt Disable.
                */
-               w = q->code;
+               w = q->devno;
                break;
             }
             q = q->bus;
@@ -331,7 +381,7 @@ Word devIN(int devno, int reg)                  /* Device INPUT */
    case DEV_DSK:
       switch (reg) {
       case BUF_A:
-         w = dev->u.DSK.status;                 /* DSK status reg */
+         w = dev->status;                       /* DSK status reg */
          break;
       case BUF_B:
          break;
@@ -340,12 +390,38 @@ Word devIN(int devno, int reg)                  /* Device INPUT */
             fprintf(stderr,"%06o/%06o Disc Maintenance!\n",PC,M[PC]);
          break;
       }
+      break;
+   case DEV_DKP:                                /* DKP?                */
+      {  int uno;
+         Flag rdy;
+
+         uno = DKP_DRV(dev->DKP_DMC);           /* calc. unit number */
+         switch (reg) {
+         case BUF_A:
+            rdy = true;
+            if (dev->units[uno].fd == NULL      /* no disc           */
+               || dev->busy                     /* doing Read/Write  */
+               || (dev->status & DKP_SEEKING(uno)) /* Seeking on drive  */
+            )
+               rdy = false;
+            if (rdy) dev->status |= DKP_RDY;
+            else dev->status &= ~DKP_RDY;
+            w = dev->status;                    /* DKP status register */
+            break;
+         case BUF_B:                            /* read address counter */
+            break;
+         case BUF_C:
+            w = dev->units[uno].DKP_DSS;        /* read unit DSS status */
+            break;
+         }
+      }
+      break;
    }
 
    return w;
 }
 
-void devOUT(int devno, int reg, Word w)         /* Device OUTPUT */
+void devOUT(Byte devno, int reg, Word w)        /* Device OUTPUT */
 {
    Device *q, *dev;
 
@@ -380,6 +456,10 @@ void devOUT(int devno, int reg, Word w)         /* Device OUTPUT */
       if (BUF_B == reg && (0100000 & w))        /* check diag mode */
          fprintf(stderr,"%06o / %06o DSK Diagnostic Mode!\n",PC,M[PC]);
       break;
+   case DEV_DKP:
+      if (BUF_A == reg)
+         dev->status &= ~(0174000 & w);         /* clear status bits */
+      break;
    }
 }
 
@@ -388,12 +468,12 @@ void enqueIO(Device *dev, int uno,  CtrlFn fn)  /* Enqueue I/O operation */
    Event *q, *evt;
 
    ASSERT(NO_LINE != dev->line);                /* ensure device connected */
-   ASSERT(0 < dev->delay);                      /* has delay set        */
-   ASSERT(IOC_START == fn || IOC_PULSE == fn);  /* only Start or Pulse  */
+   ASSERT(0 < dev->delay);                      /* has delay set         */
+   ASSERT(IOC_CLEAR != fn);                     /* only None/Start/Pulse */
 
    evt = allocEVT();
 
-   evt->devno   = dev->code;                    /* set device no  */
+   evt->devno   = dev->devno;                   /* set device no  */
    evt->uno     = uno;                          /* set unit no    */
    evt->ctrlfn  = fn;                           /* set ctrl function */
    evt->timeout = 10 * dev->delay;              /* set timeout in 0.1us */
@@ -416,75 +496,59 @@ void enqueIO(Device *dev, int uno,  CtrlFn fn)  /* Enqueue I/O operation */
 
 int lockDEV(Device *dev)
 {
-   int rc;
-
    /* NB. always lock unit0, because the controller is locked!    */
 
+   ASSERT(dev->shared);                         /* ensure shared  */
+   ASSERT(false == dev->locked);                /* not locked yet */
    ASSERT(NULL != dev->units[0].fd);            /* ensure fd      */
 
-   if (dev->shared) {                           /* shared disk?   */
-      ASSERT(false == dev->locked);             /* ensure unlcked */
-      rc = flock(fileno(dev->units[0].fd),      /* try to lock    */
-                  LOCK_EX | LOCK_NB);
-      if (-1 == rc) {                           /* failed?        */
-         if (EWOULDBLOCK == rc)                 /*    another proc uses it! */
-            return -1;
-         else {
-            Halt = H_IOErr;                     /* other I/O error*/
-            return 1;                           /*    HALT        */
-         }
-      }
-      dev->locked = true;                       /* mark locked    */
+   if (-1 == flock(fileno(dev->units[0].fd), LOCK_EX)) {/* failed to lock? */
+      Halt = H_IOErr;                           /*    I/O error   */
+      return 1;                                 /*    HALT        */
    }
+   dev->locked = true;                          /* mark locked    */
    return 0;
 }
 
 void unlockDEV(Device *dev)
 {
-   int rc;
-
    /* NB. always lock unit0, because the controller is locked!    */
 
+   ASSERT(dev->shared);                         /* ensure shared  */
+   ASSERT(dev->locked);                         /* ensure actually locked */
    ASSERT(NULL != dev->units[0].fd);            /* ensure fd      */
 
-   if (dev->shared) {                           /* shared disk?      */
-      ASSERT(dev->locked);                      /*    ensure locked  */
-      dev->locked = false;                      /*    clear locked   */
-      rc = flock(fileno(dev->units[0].fd),      /*    unlock it      */
-                           LOCK_UN);
-      if (-1 == rc)                             /* I/O error?  */
-         Halt = H_IOErr;                        /*    HALT     */
-   }
+   dev->locked   = false;                       /* clear locked status  */
+   dev->unlockTO = 0;                           /* clear unlock timeout */
+   if (-1 == flock(fileno(dev->units[0].fd), LOCK_UN))/* failed to unlock? */
+      Halt = H_IOErr;                           /*    HALT     */
 }
 
-int initDSK(Device *dev)                        /* Init DSK operation */
+int initDSK(Device *dev, CtrlFn *pCtrlfn)        /* Init DSK operation */
 {
    Tyme dt;
    Word sector, track;
-   int  rc;
 
-   dev->u.DSK.status = 0;                       /* clear status */
+   dev->status = 0;                             /* clear status */
 
    sector = 017777 & dev->DSK_DTS;              /* calc sector    */
    if (sector >= dev->units[0].nsecs)           /* sector off?    */
-      dev->u.DSK.status |= DSK_E_NODISC;        /* report NO DISC */
+      dev->status |= DSK_E_NODISC;              /* report NO DISC */
 
    track = 0177 & (sector >> 3);                /* calc track  */
    if (dev->u.DSK.protect & (1 << (track >> 4)))/* track protected?  */
-      dev->u.DSK.status |= DSK_E_WRITE;         /* report WRITE ERROR */
+      dev->status |= DSK_E_WRITE;               /* report WRITE ERROR */
 
-ErrOut:
-   if (dev->u.DSK.status) {                     /* any error?     */
-      dev->u.DSK.status |= DSK_E_ERROR;         /* set ERROR flag */
+   if (dev->status) {                           /* any error?     */
+      dev->status |= DSK_E_ERROR;               /* set ERROR flag */
       dev->delay = 3 * memTime / 10;            /* report ERROR   */
+      *pCtrlfn = IOC_NONE;                      /* no actual I/O  */
       goto Exit;                                /* done           */
    }
 
-   if ((rc = lockDEV(dev))) {                   /* lock drive     */
-      if (Halt)                                 /* something failed? */
-         return rc;                             /*    just return */
-      dev->u.DSK.status |= DSK_E_NODISC;        /* report NO DISC */
-      goto ErrOut;                              /*    return      */
+   if (dev->shared) {                           /* shared disk? */
+      lockDEV(dev);                             /*    lock it   */
+      if (Halt) return 1;                       /* I/O failed?, HALT */
    }
 
    dev->delay = 2084;                           /* actual xfer: 256 * 8us */
@@ -520,13 +584,14 @@ void doioDSK(Device *dev, Event *evt)           /* Perform DSK I/O   */
    }
    sector = (017777 & dev->DSK_DTS);            /* calc. sector */
    switch (evt->ctrlfn) {
-   case IOC_NONE:
+   case IOC_NONE:                               /* delayed error */
       break;
    case IOC_START:                              /* do READ */
       for (i = 0; i < 256; i++)
          buf[i] = dev->mem[sector + i];
       break;
    case IOC_CLEAR:
+      ASSERT(true);                             /* cannot be Clear */
       break;
    case IOC_PULSE:                              /* do WRITE */
       for (i = 0; i < 256; i++)
@@ -543,10 +608,197 @@ void doioDSK(Device *dev, Event *evt)           /* Perform DSK I/O   */
    dev->u.DSK.lastDTS = dev->DSK_DTS;           /* save last sector   */
 }
 
-void devStart(int devno)                        /* Start device `dev' */
+int initDKP(Device *dev, int uno, CtrlFn *pCtrlfn)/* Init DKP operation */
+{
+   int  mode;
+   Word cylinder, sector;
+   int  delay;
+   Tyme dt;
+   int  sic, dsic;
+   CtrlFn ctrlfn;
+
+   ctrlfn = *pCtrlfn;
+
+   dev->status &= 0177700;                      /* clear error flags  */
+   mode = DKP_MOD(dev->DKP_DMC);                /* get mode */
+
+   if (IOC_PULSE == ctrlfn && DKP_MSEEK == mode) {
+      cylinder = DKP_CYL(dev->DKP_DMC);         /* get target cylinder */
+      if (cylinder > (DKP_GEO_CC-1)) {          /* no such cylinder?   */
+         dev->status |= DKP_E_SEEK;             /*    SEEK error       */
+         goto ErrOut;                           /*    done!            */
+      }
+   }
+
+   if (dev->shared) {                           /* shared disc?      */
+      if (!dev->locked) {                       /* not locked yet?   */
+         lockDEV(dev);                          /*    lock it        */
+         if (Halt) return 1;                    /* I/O failed?, HALT */
+         dev->unlockTO = elapsedTime + 60000000;/* unlock in 6sec    */
+      }
+   }
+
+   delay = 0;
+
+   switch (ctrlfn) {
+   case IOC_NONE:
+      ASSERT(true);                             /* cannot be NONE */
+      break;
+   case IOC_START:                              /* Read/Write */
+      if (DKP_MREAD == mode || DKP_MWRITE == mode){/* Read/Write? */
+         sector = DKP_SEC(dev->DKP_DSS);        /* get sector          */
+         if (sector > (DKP_GEO_SS-1))           /* no such sector?     */
+            dev->delay = FOREVER;               /*    it takes forever */
+         else {
+            dev->delay = 3334;                  /* actual xfer: 2840us */
+            if (dev->units[uno].lastRW) {       /* no seek since last R/W? */
+               dt = usince(dev->units[uno].lastRW);   /* time lapsed   */
+               sic = (dev->units[uno].lastSEC + dt / 3334) % DKP_GEO_SS;
+               if (sector > sic)                /* calc. delta sectors */
+                  dsic = sector - sic;
+               else
+                  dsic = DKP_GEO_SS - sic + sector;
+               if (dsic < 1)                    /* 1 sector difference?*/
+                  dev->delay += 40000;          /* full rev. */
+               else
+                  dev->delay += dsic * 3334;
+            }
+            else
+               dev->delay += 20000;             /* half rev. */
+         }
+      }
+      else
+         return 1;                              /* Seek/Recalibrate w/ Start */
+      break;
+   case IOC_CLEAR:
+      ASSERT(true);                             /* cannot be Clear */
+      break;
+   case IOC_PULSE:                              /* Seek/Recalibrate */
+      if (DKP_MRECAL == mode)                   /* Recalibrate? */
+         delay = 20000 * DKP_CYL(dev->units[uno].DKP_DMC);/* 20ms * cylinder */
+      else if (DKP_MSEEK == mode)               /* Seek? */
+         delay = 20000 * abs(DKP_CYL(dev->units[uno].DKP_DMC) - DKP_CYL(dev->DKP_DMC));
+      else
+         return 1;                              /* Read/Write w/ Pulse */
+      if (delay > 135000)                       /* max. 135ms   */
+         delay = 135000;
+      dev->delay = delay;
+      break;
+   }
+
+ErrOut:
+   if (dev->status) {                           /* any error?     */
+      dev->status |= DKP_E_ERROR;               /* set ERROR flag */
+      dev->delay = 2 * memTime / 10;            /* report ERROR   */
+      *pCtrlfn = IOC_NONE;                      /* no actual I/O  */
+   }
+
+   return 0;
+}
+
+void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
+{
+   Byte uno, scnt;
+   off_t offs;
+   Word buf[256];
+   Word acnt, dmc, dss;
+   int  i, n, mode, sic;
+
+   ASSERT(dev->devno == evt->devno);            /* ensure same devno */ 
+
+   uno  = evt->uno;                             /* get unit number   */
+   dmc  = dev->units[uno].DKP_DMC;              /* get Mode/Cylinder */
+   dss  = dev->units[uno].DKP_DSS;              /* get Drive/Surf/Sec/SCnt */
+
+   ASSERT(uno == DKP_DRV(dss));                 /* ensure same unit  */
+
+   mode = DKP_MOD(dmc);                         /* get unit mode     */
+   switch (evt->ctrlfn) {
+   case IOC_NONE:                               /* just delayed error */
+      break;
+   case IOC_START:
+      if (DKP_MREAD != mode && DKP_MWRITE != mode) /* just READ or WRITE */
+         ASSERT(true);
+      acnt = dev->DKP_ACNT;                     /* get address counter */
+      scnt = DKP_SCNT(dss);                     /* get sector counter  */
+      offs =                     DKP_CYL(dmc);  /* calc. offset        */
+      offs = DKP_GEO_HH * offs + DKP_HED(dss);
+      offs = DKP_GEO_SS * offs + DKP_SEC(dss);
+      if (-1 == fseeko(dev->units[uno].fd, offs, SEEK_CUR)) {
+         Halt = H_IOErr;
+         return;
+      }
+      sic  = DKP_GEO_SS * DKP_HED(dss);         /* sector in cylinder  */
+      sic += DKP_SEC(dss);
+      do {
+         if (DKP_MREAD == mode) {               /* handle READ         */
+            n = fread(&buf[0], sizeof(Word), 256, dev->units[uno].fd);
+            if (n != SEC_SIZE) {                /* I/O failed?         */
+               Halt = H_IOErr;                  /*    HALT             */
+               return;
+            }
+            for (i = 0; i < 256; i++)           /* write buffer to     */
+               memWriteIO(acnt++, buf[i]);      /*    memory           */
+         }
+         else if (DKP_MWRITE == mode) {         /* handle WRITE        */
+            for (i = 0; i < 256; i++)           /* read buffer from    */
+               buf[i] = memReadIO(acnt++);      /*    memory           */
+            n = fwrite(&buf[0], sizeof(Word), 256, dev->units[uno].fd);
+            if (n != SEC_SIZE) {                /* I/O failed?         */
+               Halt = H_IOErr;                  /*    HALT             */
+               return;
+            }
+         }
+         scnt = 017 & (scnt + 1);               /* incr. sector count   */
+         sic++;                                 /* incr. sector in cylinder*/
+         if ((DKP_GEO_HH * DKP_GEO_SS) == sic) {/* end of cylinder? */
+            dev->status |= DKP_E_END;           /*    report END error  */
+            break;
+         }
+      } while (0 != scnt);
+
+      dev->units[uno].lastRW  = elapsedTime;    /* save lastRW and */
+      dev->units[uno].lastSEC = sic % DKP_GEO_SS;  /*    position  */
+
+                                                /* update sector counter  */
+      dev->units[uno].DKP_DSS = (0177760 & dss) + scnt;
+      if (DKP_MWRITE == mode)                   /* adjust adr counter     */
+         acnt += 2;                             /*    if WRITE            */
+      dev->DKP_ACNT = 077777 & acnt;            /* update adr counter     */
+      dev->status |= DKP_DONE_RW;               /* R/W done               */
+      if (scnt)                                 /* non-zero sector count? */
+         dev->status |= DKP_E_END;              /*    report END error    */
+      break;
+   case IOC_CLEAR:
+      ASSERT(true);                             /* cannot be CLEAR    */
+      break;
+   case IOC_PULSE:                              /* Seek/Recalibrate   */
+      offs = 0;
+      ASSERT(0 != (dev->status & DKP_SEEKING(uno)));
+      dev->units[uno].lastRW = 0;               /* clear last R/W     */
+      if (DKP_MRECAL == mode)
+         dev->units[uno].DKP_DMC = 0;
+      else if (DKP_MSEEK == mode) {
+         offs  = SEC_SIZE;
+         offs *= DKP_GEO_HH * DKP_GEO_SS * DKP_CYL(dev->units[uno].DKP_DMC);
+      }
+      else
+         ASSERT(true);                          /* fail in other Modes */
+      if (-1 == fseeko(dev->units[uno].fd, offs, SEEK_SET)) /* I/O error? */
+         Halt = H_IOErr;                        /*    HALT             */
+      dev->status &= ~DKP_SEEKING(uno);         /* clear Seeking flag  */
+      dev->status |= DKP_DONE_SEEK(uno);        /* set Seeking Done    */
+      break;
+   }
+}
+
+void devStart(Byte devno)                       /* Start device `dev' */
 {
    int uno;
    Device *dev;
+   CtrlFn ctrlfn;
+
+   ctrlfn = IOC_START;                          /* default is Start */
 
    dev = &devs[devno];                          /* point to device*/
    if (NO_LINE == dev->line)                    /* no such device */
@@ -563,7 +815,7 @@ void devStart(int devno)                        /* Start device `dev' */
    case DEV_DSK:
    case DEV_DKP:
       if (DEV_DKP == devno)                     /* calc. drive for DKP */
-         uno = dev->DKP_DSS >> 14;
+         uno = DKP_DRV(dev->DKP_DSS);
       if (!dev->units[uno].fd) {                /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
             Halt = H_MisDev;                    /*    HALT           */
@@ -642,36 +894,42 @@ void devStart(int devno)                        /* Start device `dev' */
             fprintf(stderr,                     /* check 1ms since last DOA */
                     "%06o/%06o |DSK Start - DOA| < 1ms!\n",
                     PC,M[PC]);
-         if (initDSK(dev))                      /* init I/O operation */
+         if (initDSK(dev, &ctrlfn))             /* init I/O operation */
             return;                             /* failed, return     */
+         break;
+      case DEV_DKP:
+         uno = DKP_DRV(dev->DKP_DSS);
+         if (initDKP(dev, uno, &ctrlfn))        /* init I/O operation */
+            return;                             /* failed, return     */
+         dev->units[uno].DKP_DMC = dev->DKP_DMC;/* save regs, to units */
+         dev->units[uno].DKP_DSS = dev->DKP_DSS;
          break;
       }
 
       dev->busy = true;                         /* Busy=1,Done=0 */
       dev->done = false;
 
-      enqueIO(dev, uno, IOC_START);             /* enqueue I/O */
+      enqueIO(dev, uno, ctrlfn);                /* enqueue I/O */
    }
 }
 
-void clearDSK(Device *dev)
-{
-   if (dev->busy) {                             /* I/O was in progress? */
-      if (dev->locked)                          /* device locked?       */
-         unlockDEV(dev);                        /*    unlock it         */
-   }
-   dev->u.DSK.status = 0;                       /* clear status         */
-}
-
-void devClear(int devno)                        /* Clear device `dev' */ 
+void devClear(Byte devno)                       /* Clear device `dev' */ 
 {
    Device *dev;
    Event *p, *q;
    Flag done;
 
    dev = &devs[devno];
-   if (DEV_DSK == devno)                        /* DSK?  */
-      clearDSK(dev);
+   if (DEV_DSK == devno || DEV_DKP == devno) {  /* DSK or DKP? */
+      Flag working = dev->busy ||               /* either busy */
+                     (DEV_DKP == devno && 0 != (003600 & dev->status));
+                                                /*    OR DKP Seeking    */
+      if (working) {                            /* I/O was in progress? */
+         if (dev->locked)                       /*    device locked?    */
+            unlockDEV(dev);                     /*    unlock it         */
+      }
+      dev->status = 0;
+   }
 
    if (DEV_CPU != devno)                        /* clear buffers */
       dev->buf[BUF_A] = 0;                      /* except CPU buffer A (SW) */
@@ -710,25 +968,27 @@ void devClear(int devno)                        /* Clear device `dev' */
    }
 }
 
-void devPulse(int devno)                        /* Pulse device `dev' */
+void devPulse(Byte devno)                       /* Pulse device `dev' */
 {
-   int drv;
+   Byte uno;
    Device *dev;
+   CtrlFn ctrlfn;
 
    dev = &devs[devno];                          /* point to device   */
+   ctrlfn = IOC_PULSE;                          /* default is Pulse  */
 
-   drv = 0;
+   uno = 0;
    switch (devno) {
    case DEV_DSK:
    case DEV_DKP:
       if (DEV_DKP == devno)                     /* calc. drive for DKP */
-         drv = dev->DKP_DSS >> 14;
-      if (!dev->units[drv].fd) {                /* no file assigned? */
+         uno = DKP_DRV(dev->DKP_DSS);
+      if (!dev->units[uno].fd) {                /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
             Halt = H_MisDev;                    /*    HALT           */
          return;
       }
-      if (dev->units[drv].rdonly) {             /* drive read-only?  */
+      if (dev->units[uno].rdonly) {             /* drive read-only?  */
          Halt = H_ReadOnly;                     /*    HALT           */
          return;
       }
@@ -737,22 +997,38 @@ void devPulse(int devno)                        /* Pulse device `dev' */
       break;
    }
 
-   if (DEV_DSK == devno) {                      /* DSK? */
-      if (initDSK(dev))                         /* init I/O operation */
-         return;                                /* failed, return     */
-   }
-
    switch (devno) {
    case DEV_MDV:                                /* MDV MUL   */
-      enqueIO(dev, 0, IOC_PULSE);
       break;
    case DEV_DSK:                                /* DSK Write */
+      if (initDSK(dev, &ctrlfn))                /* init I/O operation */
+         return;                                /* failed, return     */
       if (usince(dev->u.DSK.lastDOA) < 1000)    /* check 1ms since last DOA */
          fprintf(stderr,"%06o/%06o |DSK Pulse - DOA| < 1ms!\n",
                   PC,M[PC]);
-      enqueIO(dev, 0, IOC_PULSE);
       break;
+   case DEV_DKP:
+      uno = DKP_DRV(dev->DKP_DSS);              /* get unit number    */
+      if (dev->status & DKP_SEEKING(uno))       /* already Seek or Recal? */
+         return;
+      if (initDKP(dev, uno, &ctrlfn))           /* init I/O operation */
+         return;                                /* failed, return     */
+      dev->status &= 0177700;                   /* clear error flags  */
+      dev->status |= DKP_SEEKING(uno);          /* set seeking flag   */
+                                                /* XXX: set by Recal? */
+      dev->units[uno].DKP_DMC = dev->DKP_DMC;   /* save regs, to units */
+      dev->units[uno].DKP_DSS = dev->DKP_DSS;
+      break;
+   default:                                     /* default case:       */
+      return;                                   /*    do NOT start I/O */
    }
+
+   if (DEV_DSK == devno)
+      dev->busy = true;                        /* Busy=1,Done=0 */
+   dev->done = false;
+
+   enqueIO(dev, uno, ctrlfn);
+
    return;
 }
 
@@ -794,7 +1070,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
    ASSERT(NULL == evt->que);                    /* removed from event queue */
    ASSERT(NO_LINE != dev->line);                /* ensure device present */
 
-   switch (dev->code) {
+   switch (dev->devno) {
    case DEV_MDV:                                /* MDV has no FFs */
       break;
    case DEV_LPT:
@@ -807,7 +1083,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
       dev->busy = false;
    }
 
-   switch (dev->code) {
+   switch (dev->devno) {
    case DEV_MDV:
       switch (evt->ctrlfn) {
       case IOC_NONE:
@@ -877,9 +1153,16 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
       }
       break;
    case DEV_DSK:                                /* DSK? */
-      if (0 == dev->u.DSK.status) {             /* if no ERROR */
-         doioDSK(dev, evt);                     /*    perform I/O */
-         unlockDEV(dev);                        /*    unlock it   */
+      doioDSK(dev, evt);                        /*    perform I/O */
+      if (dev->locked)                          /*    unlock it   */
+         unlockDEV(dev);
+      break;
+   case DEV_DKP:                                /* DKP? */
+      doioDSK(dev, evt);                        /*    perform I/O */
+      if (dev->locked) {
+         ASSERT(IOC_NONE != evt->ctrlfn);       /* ensure unlocked if no I/O */
+         if (IOC_START == evt->ctrlfn)          /* was a Read/Write? */
+            unlockDEV(dev);                     /*    unlock it      */
       }
       break;
    }
@@ -918,7 +1201,8 @@ void doIO(int dt)                               /* Do Input/Output   */
 
 void finish(void)
 {
-   int i, drv;
+   int i;
+   Byte uno;
    Device *dev;
 
    dev = &devs[DEV_DSK];                        /* point to DSK   */
@@ -940,10 +1224,10 @@ void finish(void)
 LCloseAll:
    for (i = 1; i < NDEV; i++) {                 /* close all open storage */
       dev = &devs[i];
-      for (drv = 0; drv < 4; drv++)             /* for each drive */
-         if (NULL != dev->units[drv].fd) {
-            if (EOF == fclose(dev->units[drv].fd))/* close, check status */
-               fprintf(stderr,"fclose(): failed to close %s!\n",dev->units[drv].path);
+      for (uno = 0; uno < 4; uno++)             /* for each drive */
+         if (NULL != dev->units[uno].fd) {
+            if (EOF == fclose(dev->units[uno].fd))/* close, check status */
+               fprintf(stderr,"fclose(): failed to close %s!\n",dev->units[uno].path);
          }
    }
 }
@@ -965,14 +1249,15 @@ int keyIndex(char *key, char *pfx)
 
 void initDevs(int nopts, Option *opts)
 {
-   int i, devno, drv;
+   int i;
+   Byte devno, uno;
    Device *q, *dev;
    Option *opt;
 
    static struct {
-      int dev;
-      int line;
-      int delay;
+      Byte devno;
+      Byte line;
+      int  delay;
    } inits[] = {
       {DEV_MDV, 16,     7},  /* 6.8us MUL, 7.2us DIV */
       {DEV_TTI, 14, 100000},  /*  10cps */
@@ -982,7 +1267,7 @@ void initDevs(int nopts, Option *opts)
       {DEV_RTC, 13,  20000},  /*  50Hz  */
       {DEV_LPT, 12,  20000},  /* 6us char buf xmit, 20ms/zone print */
       {DEV_DSK,  9,   2084},  /* 2084us/sector */
-      {DEV_DKP,  7,   2000},
+      {DEV_DKP,  7,   3334},  /* 3334us/sector */
       {DEV_CPU, 16,      0},  /* dummy line */
       {      0,  0,      0}
    };
@@ -992,28 +1277,33 @@ void initDevs(int nopts, Option *opts)
 
    for (i = 0; i < NDEV; i++) {
       dev = &devs[i];
-      dev->code   = i;
+      dev->devno   = i;
       dev->intdis = false;
       dev->intreq = false;
       dev->line   = NO_LINE;
       dev->delay  = 0;
       dev->bus    = NULL;
-      for (drv = 0; drv < 4; drv++) {
-         dev->units[drv].path  = NULL;
-         dev->units[drv].fd    = NULL;
-         dev->units[drv].nsecs = 0;
-         dev->units[drv].rdonly=false;
+      for (uno = 0; uno < 4; uno++) {
+         dev->units[uno].path  = NULL;
+         dev->units[uno].fd    = NULL;
+         dev->units[uno].nsecs = 0;
+         dev->units[uno].rdonly=false;
+         dev->units[uno].buf[BUF_A] = 0;
+         dev->units[uno].buf[BUF_B] = 0;
+         dev->units[uno].buf[BUF_C] = 0;
+         dev->units[uno].lastRW  = 0;
       }
       dev->mem    = NULL;
       dev->shared = false;
       dev->locked = false;
+      dev->unlockTO = 0;
    }
 
-   IREQ = 0;
+   IREQ  = 0;  /* no. of INT requests */
 
    BUS = NULL;
-   for (i = 0; inits[i].dev; i++) {
-      devno = inits[i].dev;
+   for (i = 0; inits[i].devno; i++) {
+      devno = inits[i].devno;
       dev = &devs[devno];
       dev->line  = inits[i].line;
       dev->delay = inits[i].delay;
@@ -1036,13 +1326,14 @@ void initDevs(int nopts, Option *opts)
 
    for (i = 0; i < nopts; i++) {
       char *mode = NULL;
+      char *errmsg = NULL;
 
-      opt = &opts[i];
-      devno = opts[i].dev;
-      dev = &devs[devno];
+      opt   = &opts[i];
+      devno = opts[i].devno;
+      dev   = &devs[devno];
       if (0 == strncmp(opt->key, "file", 4)) {  /* storage file   */
-         drv = 0;
-         switch (opt->dev) {
+         uno = 0;
+         switch (opt->devno) {
          case DEV_TTI:
             mode = "rb"; break;
          case DEV_TTO:
@@ -1056,51 +1347,64 @@ void initDevs(int nopts, Option *opts)
          case DEV_DSK:
             mode = "w+b"; break;
          case DEV_DKP:
-            drv = keyIndex(opt->key, "file");   /* get drive no.  */
-            if (drv < 0 || drv > 3) goto ErrOut;/* max 4 drives   */
+            uno = keyIndex(opt->key, "file");   /* get drive no.  */
+            if (uno < 0 || uno > 3) goto ErrOut;/* max 4 drives   */
             mode = "w+b"; break;
          default: break;
          }
          if (!mode) goto ErrOut;
-         dev->units[drv].fd = fopen(opt->value,mode);
-         if (NULL == dev->units[drv].fd) {
-            fprintf(stderr,"%s: cannot open %s!\n",io_devs(opt->dev),opt->value);
+         dev->units[uno].fd = fopen(opt->value,mode);
+         if (NULL == dev->units[uno].fd) {
+            fprintf(stderr,"%s: cannot open %s!\n",
+                     io_devs(opt->devno),
+                     opt->value);
             exit(1);
          }
-         dev->units[drv].path = opt->value;
-         if (DEV_DSK == opt->dev || DEV_DKP == opt->dev) {
+         dev->units[uno].path = opt->value;
+         if (DEV_DSK == opt->devno || DEV_DKP == opt->devno) {
             off_t nsecs;
-            if (-1 == fseek(dev->units[drv].fd, 0, SEEK_END)) {
+            if (-1 == fseek(dev->units[uno].fd, 0, SEEK_END)) {
                fprintf(stderr,"fseek(): SEEK_END (%s)\n",opt->value);
                exit(1);
             }
-            nsecs = ftello(dev->units[drv].fd);
+            nsecs = ftello(dev->units[uno].fd);
             if ((off_t)-1 == nsecs) {
                fprintf(stderr,"ftello(): %s!\n",opt->value);
                exit(1);
             }
             nsecs = nsecs / SEC_SIZE;
-            if (DEV_DSK == opt->dev) {
-               if (nsecs < 256 || nsecs > 65536) {
-                  fprintf(stderr,"%s: invalid size [64K - 2048K]!\n",opt->value);
-                  exit(1);
-               }
+            errmsg = NULL;
+            if (DEV_DSK == opt->devno) {
+               if (nsecs < 256 || nsecs > 65536)
+                  errmsg = "[64K - 2048K]!\n";
             }
-            dev->units[drv].nsecs = nsecs;
-            if (-1 == fseek(dev->units[drv].fd, 0, SEEK_SET)) {
+            else if (DEV_DKP == opt->devno) {
+               /* Diablo 31 style */
+               if (DKP_NSEC != nsecs)
+                  errmsg = "[1218K]!\n";
+            }
+            if (errmsg) {
+               fprintf(stderr,"%s: %s unit%d has invalid size %s!\n",
+                        opt->value,
+                        io_devs(opt->devno),
+                        uno,
+                        errmsg);
+            }
+            dev->units[uno].nsecs = nsecs;
+            if (-1 == fseek(dev->units[uno].fd, 0, SEEK_SET)) {
                fprintf(stderr,"fseek(): SEEK_SET (%s)!\n",opt->value);
                exit(1);
             }
          }
          if (DEV_DSK == devno) {
             long nsecs;
-            dev->mem = (Word*)malloc(dev->units[drv].nsecs * SEC_SIZE);
+            dev->mem = (Word*)malloc(dev->units[uno].nsecs * SEC_SIZE);
             if (NULL == dev->mem) {
                fprintf(stderr,"malloc(): not enough memory (%s)!\n",opt->value);
                exit(1);
             }
-            nsecs = fread(dev->mem, SEC_SIZE, dev->units[drv].nsecs, dev->units[drv].fd);
-            if (nsecs != dev->units[drv].nsecs) {
+            nsecs = fread(dev->mem, SEC_SIZE, dev->units[uno].nsecs, dev->units[uno].fd);
+            if (nsecs != SEC_SIZE * dev->units[uno].nsecs) {
                fprintf(stderr,"fdread(): %s!\n",opt->value);
                exit(1);
             }
@@ -1115,9 +1419,9 @@ void initDevs(int nopts, Option *opts)
       }
       else if (0 == strncmp(opt->key, "rdonly", 6)) {
          if (DEV_DSK == devno || DEV_DKP == devno) {
-            int drv = keyIndex(opt->key, "rdonly");
-            if (drv < 0) goto ErrOut;
-            dev->units[drv].rdonly = atoi(opt->value)? true : false;
+            uno = keyIndex(opt->key, "rdonly");
+            if (uno < 0) goto ErrOut;
+            dev->units[uno].rdonly = atoi(opt->value)? true : false;
          }
       }
       else if (0 == strcmp(opt->key, "shared")) {
@@ -1143,7 +1447,7 @@ void initDevs(int nopts, Option *opts)
    return;
 
 ErrOut:
-   fprintf(stderr,"%s: unknown option %s!\n",io_devs(opt->dev),opt->key);
+   fprintf(stderr,"%s: unknown option %s!\n",io_devs(opt->devno),opt->key);
    exit(1);
 
    /* 
@@ -1366,6 +1670,13 @@ void execute(Word IR)
    if (QUE && elapsedTime >= eventTime)         /* do Input/Output */
       doIO(elapsedTime - ioTime);
 
+   if (devs[DEV_DKP].unlockTO                   /* unlock timeout present? */
+      && elapsedTime >= devs[DEV_DKP].unlockTO) /*    time passed?         */
+   {
+      ASSERT(devs[DEV_DKP].locked);             /* ensure locked  */
+      unlockDEV(&devs[DEV_DKP]);
+   }
+
    /* DCH has priority */
 
    if (IREQ && ION) {                           /* any IntReqs and IntOn ? */
@@ -1471,31 +1782,32 @@ void execute(Word IR)
       if (cond) PC = 077777 & (PC + 1);
    }
    else if (IR > 057777) { /* Input/Output */
-      int dev, ctrl, tfer, ac;
+      int ctrl, tfer, ac;
+      Byte devno;
 
-      dev  = IR & 077; IR >>= 6;
-      ctrl = IR &   3; IR >>= 2;
-      tfer = IR &   7; IR >>= 3;
-      ac   = IR &   3; IR >>= 2;
+      devno = IR & 077; IR >>= 6;
+      ctrl  = IR &   3; IR >>= 2;
+      tfer  = IR &   7; IR >>= 3;
+      ac    = IR &   3; IR >>= 2;
 
       if (tfer && tfer != 7) {
          if (tfer & 1)
-            AC[ac] = devIN(dev,(tfer-1)/2);
+            AC[ac] = devIN(devno,(tfer-1)/2);
          else
-            devOUT(dev,(tfer-1)/2,AC[ac]);
+            devOUT(devno,(tfer-1)/2,AC[ac]);
       }
 
       switch (ctrl) {
       case 0: /* Do not activate */
          break;
       case 1: /* S start dev */
-         devStart(dev);
+         devStart(devno);
          break;
       case 2: /* C clear dev */
-         devClear(dev);
+         devClear(devno);
          break;
       case 3: /* P pulse dev */
-         devPulse(dev);
+         devPulse(devno);
          break;
       }
 
@@ -1505,16 +1817,16 @@ void execute(Word IR)
          cond = 0;
          switch (ctrl) {
          case 0: /* SKPBN */
-            cond = devs[dev].busy != false; 
+            cond = devs[devno].busy != false;
             break;
          case 1: /* SKPBZ */
-            cond = devs[dev].busy == false;
+            cond = devs[devno].busy == false;
             break;
          case 2: /* SKPDN */
-            cond =  devs[dev].done != false;
+            cond =  devs[devno].done != false;
             break;
          case 3: /* SKPDZ */
-            cond = devs[dev].done == false;
+            cond = devs[devno].done == false;
             break;
          }
          if (cond) PC = 077777 & (PC + 1);
@@ -1705,7 +2017,7 @@ char* mem_acs[]     = {"JMP", "JSR", "ISZ", "DSZ"};
 char* mem_fns[]     = {"jmp", "LDA", "STA", "i/o"};
 
 struct {
-   int code;
+   Byte devno;
    char *name;
 } devnames[] = {
    {DEV_MDV, "MDV"},
@@ -1721,27 +2033,27 @@ struct {
    {      0, "NULL"}
 };
 
-int str2dev(char *nm)
+Byte str2dev(char *nm)
 {
    int i;
 
    for (i = 0; devnames[i].name; i++) {
       if (0 == strcmp(devnames[i].name, nm))
-         return devnames[i].code;
+         return devnames[i].devno;
    }
 
    return 0;
 }
 
-char *io_devs(int dev)
+char *io_devs(Byte devno)
 {
    static char buf[8];
    int i;
    
    for (i = 0; NULL != devnames[i].name; i++)
-      if (dev == devnames[i].code)
+      if (devno == devnames[i].devno)
          return devnames[i].name;
-   sprintf(buf, "%02o", dev);
+   sprintf(buf, "%02o", devno);
    return &buf[0];
 }
 
@@ -1864,7 +2176,7 @@ void showQUE(void)                              /* Show event QUE */
       ASSERT(0 != evt->devno);
       dev = &devs[evt->devno];
       printf("%s BUFs: %06o %06o %06o %c%c%c%c %02d %6d %6d %s\n",
-         io_devs(dev->code),
+         io_devs(dev->devno),
          dev->buf[BUF_A], dev->buf[BUF_B], dev->buf[BUF_C],
            dev->busy? 'B' : ' ',
            dev->done? 'D' : ' ',
@@ -2319,8 +2631,8 @@ void initOpts(int argc, char *argv[])
 {
    int i;
    char buf[8];
-   int dev;
-   int nopts;
+   Byte devno;
+   int  nopts;
    Option opts[MAX_OPTS];
 
    nopts = 0;
@@ -2338,8 +2650,8 @@ void initOpts(int argc, char *argv[])
       strncpy(buf,arg,3);
       buf[3] = '\0'; 
 
-      dev = str2dev(buf);
-      if (0 == dev) {
+      devno = str2dev(buf);
+      if (0 == devno) {
          fprintf(stderr,"%s device not found!",buf);
          exit(1);
       }
@@ -2347,7 +2659,7 @@ void initOpts(int argc, char *argv[])
          fprintf(stderr,"too many options!");
          exit(1);
       }
-      opts[nopts].dev = dev;
+      opts[nopts].devno = devno;
       if (parseOpt(arg + 3, &opts[nopts])) {
          fprintf(stderr,"%s invalid option!",arg+3);
          exit(1);
