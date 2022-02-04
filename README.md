@@ -9,6 +9,7 @@ Options:
   * set disc controller shared, -DEVshared=0|1
 
 Changes:
+  * standalone event queue, each device can fire multiple events
   * shared disc controllers
   * read-only drives
   * DSK simulation (not debugged), cached in memory, write protection

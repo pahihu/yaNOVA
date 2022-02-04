@@ -99,6 +99,17 @@ typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
 #define DKP_ACNT     buf[BUF_B]
 #define DKP_DSS      buf[BUF_C]
 
+typedef struct _Event {
+   Byte devno;       /* device number */
+   Byte uno;         /* unit number */
+   CtrlFn ctrlfn;    /* control fn, which started the operation */
+   int  timeout;     /* when reaches 0, done is set */
+   struct _Event *que;  /* next event in the queue  */
+} Event;
+
+#define NEVENT 256
+Event events[NEVENT];
+
 typedef struct _Device {
    Byte code;        /* device code */
    Word buf[3];
@@ -107,10 +118,7 @@ typedef struct _Device {
    Flag intreq;      /* INT request */
    Byte line;        /* bus line: 0-15, NO_LINE - missing device */
    int  delay;       /* device delay */
-   int  timeout;     /* when reaches 0, done is set */
-   CtrlFn ctrlfn;    /* control function, which started the operation */
    struct _Device *bus; /* next device on I/O bus */
-   struct _Device *que; /* next device on event queue */
    struct {
       char  *path;   /* storage file names */
       FILE  *fd;     /* file handles */
@@ -159,7 +167,7 @@ Tyme usince(Tyme base)
 }
 
 Device *BUS;         /* I/O bus, fastest device(s) first */
-Device *QUE;         /* event queue, most recent device event first */
+Event *QUE;          /* event queue, most recent device event first */
 int IREQ;            /* no. of pending INT requests */
 Flag delayION;       /* delayed ION */
 Device devs[64];
@@ -196,6 +204,29 @@ Word BRK[2048];
 
 #define BRAKE(x)  (BRK[(x)>>4] & (1 << ((x) & 15)))
 
+Event *allocEVT(void)
+{
+   int steps;
+   static int pos = 0;                          /* start search from here  */
+
+   steps = 0;                                   /* init steps  */
+   while ((steps < NEVENT) &&                   /* 1 cycle should not lapse */
+          0 != events[pos & (NEVENT - 1)].devno)/*    AND devno be clear    */
+   {
+      pos++;                                    /* check next post   */
+      steps++;                                  /* count steps       */
+   }
+   ASSERT(steps != NEVENT);                     /* ALL EVENTS USED!  */
+
+   return &events[pos++ & (NEVENT - 1)];        /* return event ptr  */
+}
+
+void clearEVT(Event *evt)
+{
+   evt->devno = 0;
+   evt->que   = NULL;
+}
+
 /* return prev.device where t < dev->delay */
 Device* insertBUS(int t)
 {
@@ -212,9 +243,9 @@ Device* insertBUS(int t)
 }
 
 /* return prev.device where t < dev->timeout */
-Device* insertQUE(int t)
+Event* insertQUE(int t)
 {
-   Device *p, *q;
+   Event *p, *q;
 
    p = NULL; q = QUE;
    while (q) {
@@ -227,20 +258,19 @@ Device* insertQUE(int t)
 }
 
 /* return pointer to previous device in the queue */
-Device* removeQUE(int devno)
+Event* removeQUE(int devno)
 {
-   Device *p, *q;
+   Event *p, *q;
 
    p = NULL; q = QUE;
    while (q) {
-      if (devno == q->code)
+      if (devno == q->devno)
          return p;
       p = q;
       q = q->que;
    }
-
-   /* NB. device not found in the event QUE, but has positive timeout */
-   ASSERT(NULL == QUE);
+   
+   /* NB. if p is NULL then either QUE is empty, or devno not found! */
 
    return p;
 }
@@ -248,16 +278,18 @@ Device* removeQUE(int devno)
 void IORST(void)                                /* IORST */
 {
    Device *q;
+   int i;
 
    q = BUS;                                     /* clear ctrl FFs in all devs */
    while (q) {
-      q->timeout = 0;                           /* do NOT trigger QUE removal */
       devClear(q->code);                        /* Clear dev (intreq cleared) */
       q->intdis = false;                        /* clear IntDisable */
-      q->que = NULL;                            /* clear event QUE ptr */
       q = q->bus;                               /* next device on BUS */
    }
-   QUE = NULL;                                  /* clear the event QUE */
+
+   for (i = 0; i < NEVENT; i++)                 /* clear event QUE   */
+      clearEVT(&events[i]);
+   QUE = NULL;
 }
 
 Word devIN(int devno, int reg)                  /* Device INPUT */
@@ -351,28 +383,32 @@ void devOUT(int devno, int reg, Word w)         /* Device OUTPUT */
    }
 }
 
-void enqueIO(Device *dev, CtrlFn fn)            /* Enqueue I/O operation */
+void enqueIO(Device *dev, int uno,  CtrlFn fn)  /* Enqueue I/O operation */
 {
-   Device *q;
+   Event *q, *evt;
 
    ASSERT(NO_LINE != dev->line);                /* ensure device connected */
    ASSERT(0 < dev->delay);                      /* has delay set        */
    ASSERT(IOC_START == fn || IOC_PULSE == fn);  /* only Start or Pulse  */
 
-   dev->ctrlfn  = fn;                           /* set control function */
-   dev->timeout = 10 * dev->delay;              /* set timeout in 0.1us */
+   evt = allocEVT();
+
+   evt->devno   = dev->code;                    /* set device no  */
+   evt->uno     = uno;                          /* set unit no    */
+   evt->ctrlfn  = fn;                           /* set ctrl function */
+   evt->timeout = 10 * dev->delay;              /* set timeout in 0.1us */
 
    if (QUE)                                     /* QUE not empty?   */ 
       doIO(elapsedTime - ioTime);               /* step all devs[]  */
 
-   q = insertQUE(dev->timeout);                 /* get insert pos */
+   q = insertQUE(evt->timeout);                 /* get insert pos */
    if (NULL == q) {                             /* be the first one */
-      dev->que = QUE;                           /* insert dev */
-      QUE = dev;
+      evt->que = QUE;                           /* insert dev */
+      QUE = evt;
    }
    else {
-      dev->que = q->que;                        /* insert after `q' */
-      q->que = dev;
+      evt->que = q->que;                        /* insert after `q' */
+      q->que = evt;
    }
    ioTime = elapsedTime;                        /* reset ioTime     */
    eventTime = ioTime + QUE->timeout;           /*    and eventTime */
@@ -472,62 +508,44 @@ Exit:
    return 0;
 }
 
-void doioDSK(Device *dev)                       /* Perform DSK I/O   */
+void doioDSK(Device *dev, Event *evt)           /* Perform DSK I/O   */
 {
    Word buf[256];
    int  i;
-   int  n, nWords;
-   int  to;
-   unsigned long sector;
+   Word sector;
 
-   nWords = 256;                                /* assume a sector */
-   to = dev->timeout / 10;                      /* timeout in us   */
-   if (dev->timeout > 0) {                      /* timeout nonzero (Clear)?*/
-      if (to >= 2048)                           /* more than sector xfer?  */
-         nWords = 0;                            /* no words processed */
-      else
-         nWords = to / 8;                       /* partial I/O only  */
-   }
-   if (0 == nWords)                             /* no words processed? */
-      goto Exit;                                /*    exit  */
-   if (IOC_PULSE == dev->ctrlfn) {              /* was a WRITE?   */
-      for (i = 0; i < nWords; i++)              /* read words     */
+   if (IOC_PULSE == evt->ctrlfn) {              /* was a WRITE?   */
+      for (i = 0; i < 256; i++)                 /* read words     */
          buf[i] = memReadIO(dev->DSK_ACNT + i); /* from memory*/
    }
    sector = (017777 & dev->DSK_DTS);            /* calc. sector */
-   n = nWords;
-   switch (dev->ctrlfn) {
+   switch (evt->ctrlfn) {
    case IOC_NONE:
       break;
    case IOC_START:                              /* do READ */
-      for (i = 0; i < nWords; i++)
+      for (i = 0; i < 256; i++)
          buf[i] = dev->mem[sector + i];
       break;
    case IOC_CLEAR:
       break;
    case IOC_PULSE:                              /* do WRITE */
-      for (i = 0; i < nWords; i++)
+      for (i = 0; i < 256; i++)
          dev->mem[sector + i] = buf[i];
       break;
    }
-   if (n != nWords) {                           /* partial phys. I/O? */
-      Halt = H_IOErr;                           /*    HALT            */
-      return;
-   }
-   if (IOC_START == dev->ctrlfn) {              /* was a READ? */
-      for (i = 0; i < nWords; i++)              /* write words */
+   if (IOC_START == evt->ctrlfn) {              /* was a READ? */
+      for (i = 0; i < 256; i++)                 /* write words */
          memWriteIO(dev->DSK_ACNT + i, buf[i]); /* to memory*/
    }
-Exit:
-   dev->DSK_ACNT += nWords;                     /* update address cnt */
-   if (IOC_PULSE == dev->ctrlfn)                /* was a WRITE?       */
+   dev->DSK_ACNT += 256;                        /* update address cnt */
+   if (IOC_PULSE == evt->ctrlfn)                /* was a WRITE?       */
       dev->DSK_ACNT += 2;                       /*    ahead 2 words   */
    dev->u.DSK.lastDTS = dev->DSK_DTS;           /* save last sector   */
 }
 
 void devStart(int devno)                        /* Start device `dev' */
 {
-   int drv;
+   int uno;
    Device *dev;
 
    dev = &devs[devno];                          /* point to device*/
@@ -537,7 +555,7 @@ void devStart(int devno)                        /* Start device `dev' */
    if (dev->busy)                               /* device busy?   */
       return;                                   /*    do nothing. */
 
-   drv = 0;
+   uno = 0;
    switch (devno) {
    case DEV_PTR:
    case DEV_PTP:
@@ -545,8 +563,8 @@ void devStart(int devno)                        /* Start device `dev' */
    case DEV_DSK:
    case DEV_DKP:
       if (DEV_DKP == devno)                     /* calc. drive for DKP */
-         drv = dev->DKP_DSS >> 14;
-      if (!dev->units[drv].fd) {                /* no file assigned? */
+         uno = dev->DKP_DSS >> 14;
+      if (!dev->units[uno].fd) {                /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
             Halt = H_MisDev;                    /*    HALT           */
          return;
@@ -632,24 +650,28 @@ void devStart(int devno)                        /* Start device `dev' */
       dev->busy = true;                         /* Busy=1,Done=0 */
       dev->done = false;
 
-      enqueIO(dev, IOC_START);                  /* enqueue I/O */
+      enqueIO(dev, uno, IOC_START);             /* enqueue I/O */
    }
+}
+
+void clearDSK(Device *dev)
+{
+   if (dev->busy) {                             /* I/O was in progress? */
+      if (dev->locked)                          /* device locked?       */
+         unlockDEV(dev);                        /*    unlock it         */
+   }
+   dev->u.DSK.status = 0;                       /* clear status         */
 }
 
 void devClear(int devno)                        /* Clear device `dev' */ 
 {
-   Device *q, *dev;
+   Device *dev;
+   Event *p, *q;
+   Flag done;
 
    dev = &devs[devno];
-   if (DEV_DSK == devno) {                      /* DSK?  */
-      if (dev->busy) {                          /* I/O was in progress? */
-         if (0 == dev->u.DSK.status) {          /* disk status clear?   */
-            doioDSK(dev);                       /*    do PARTIAL I/O    */
-            unlockDEV(dev);                     /*    unlock it         */
-         }
-      }
-      dev->u.DSK.status = 0;                    /* clear status   */
-   }
+   if (DEV_DSK == devno)                        /* DSK?  */
+      clearDSK(dev);
 
    if (DEV_CPU != devno)                        /* clear buffers */
       dev->buf[BUF_A] = 0;                      /* except CPU buffer A (SW) */
@@ -658,19 +680,30 @@ void devClear(int devno)                        /* Clear device `dev' */
    if (DEV_MDV != devno)
       dev->buf[BUF_C] = 0;
 
+   done = false;
+   while (!done) {                              /* remove all events for devno*/
+      q = removeQUE(devno);                     /* get prev entry       */
+      if (NULL == q) {                          /* first OR not found?  */
+         if (QUE && devno == QUE->devno) {      /* first entry?         */
+            q = QUE;                            /* remove it            */
+            QUE = q->que;
+         }
+         else
+            done = true;                        /* empty QUE OR not found  */
+      }
+      else {
+         p = q->que;                            /* point to devno event */
+         ASSERT(devno == p->devno);             /* ensure devno event   */
+         q->que = p->que;                       /* remove it            */
+         q = p;
+      }
+
+      if (q)
+         clearEVT(q);
+   }
+
    dev->busy = false;                           /* clear control FFs */
    dev->done = false;
-
-   if (dev->timeout) {                          /* has timeout?   */
-      q = removeQUE(devno);                     /* remove from event QUE */
-      if (NULL == q)                            /* 1st entry? */
-         QUE = dev->que;
-      else
-         q->que = dev->que;                     /* remove the entry  */
-
-      dev->timeout = 0;                         /* clear timeout     */
-      dev->que = NULL;                          /* clear queue ptr   */
-   }
 
    if (dev->intreq) {                           /* INT request pending?  */
       dev->intreq = false; IREQ--;              /* clear dev and CPU flag*/
@@ -711,11 +744,13 @@ void devPulse(int devno)                        /* Pulse device `dev' */
 
    switch (devno) {
    case DEV_MDV:                                /* MDV MUL   */
+      enqueIO(dev, 0, IOC_PULSE);
+      break;
    case DEV_DSK:                                /* DSK Write */
       if (usince(dev->u.DSK.lastDOA) < 1000)    /* check 1ms since last DOA */
          fprintf(stderr,"%06o/%06o |DSK Pulse - DOA| < 1ms!\n",
                   PC,M[PC]);
-      enqueIO(dev, IOC_PULSE);
+      enqueIO(dev, 0, IOC_PULSE);
       break;
    }
    return;
@@ -749,12 +784,15 @@ void writeChar(Device *dev, int ch)
       Halt = H_IOErr;
 }
 
-void devDone(Device *dev)                       /* Device done, ie timed out */
+void devDone(Event *evt)                       /* Device done, ie timed out */
 {
    int ch;
+   Device *dev;
 
+   dev = &devs[evt->devno];                     /* get device data   */
+
+   ASSERT(NULL == evt->que);                    /* removed from event queue */
    ASSERT(NO_LINE != dev->line);                /* ensure device present */
-   ASSERT(NULL == dev->que);                    /* removed from event queue */
 
    switch (dev->code) {
    case DEV_MDV:                                /* MDV has no FFs */
@@ -771,7 +809,7 @@ void devDone(Device *dev)                       /* Device done, ie timed out */
 
    switch (dev->code) {
    case DEV_MDV:
-      switch (dev->ctrlfn) {
+      switch (evt->ctrlfn) {
       case IOC_NONE:
          break;
       case IOC_START:                           /* MDV DIV */
@@ -840,13 +878,11 @@ void devDone(Device *dev)                       /* Device done, ie timed out */
       break;
    case DEV_DSK:                                /* DSK? */
       if (0 == dev->u.DSK.status) {             /* if no ERROR */
-         doioDSK(dev);                          /*    perform I/O */
+         doioDSK(dev, evt);                     /*    perform I/O */
          unlockDEV(dev);                        /*    unlock it   */
       }
       break;
    }
-
-   dev->ctrlfn = IOC_NONE;                      /* clear control function */
 
    if (true == dev->done                        /* Done set?                */
        && false == dev->intdis)                 /*    and IntDisable clear? */
@@ -861,7 +897,7 @@ void devDone(Device *dev)                       /* Device done, ie timed out */
 */
 void doIO(int dt)                               /* Do Input/Output   */
 {
-   Device *q;
+   Event *q;
 
    q = QUE;                                     /* elapsed dt time   */
    while (q) {
@@ -951,16 +987,17 @@ void initDevs(int nopts, Option *opts)
       {      0,  0,      0}
    };
 
+   for (i = 0; i < NEVENT; i++)                 /* clear event storage */
+      clearEVT(&events[i]);
+
    for (i = 0; i < NDEV; i++) {
       dev = &devs[i];
-      dev->code    = i;
-      dev->intdis  = false;
-      dev->intreq  = false;
-      dev->line    = NO_LINE;
-      dev->delay   = 0;
-      dev->timeout = 0;
-      dev->ctrlfn  = IOC_NONE;
-      dev->bus = dev->que = NULL;
+      dev->code   = i;
+      dev->intdis = false;
+      dev->intreq = false;
+      dev->line   = NO_LINE;
+      dev->delay  = 0;
+      dev->bus    = NULL;
       for (drv = 0; drv < 4; drv++) {
          dev->units[drv].path  = NULL;
          dev->units[drv].fd    = NULL;
@@ -1819,21 +1856,24 @@ void disasm(Word IR)
 void showQUE(void)                              /* Show event QUE */
 {
    static char* ctrlfns[] = {"NONE", "START", "CLEAR", "PULSE"};
-   Device *q;
+   Event *evt;
+   Device *dev;
 
-   q = QUE;
-   while (q) {
+   evt = QUE;
+   while (evt) {
+      ASSERT(0 != evt->devno);
+      dev = &devs[evt->devno];
       printf("%s BUFs: %06o %06o %06o %c%c%c%c %02d %6d %6d %s\n",
-         io_devs(q->code),
-         q->buf[BUF_A], q->buf[BUF_B], q->buf[BUF_C],
-           q->busy? 'B' : ' ',
-           q->done? 'D' : ' ',
-         q->intdis? 'I' : ' ',
-         q->intreq? 'R' : ' ',
-         q->line,
-         q->delay, q->timeout,
-         ctrlfns[q->ctrlfn]);
-      q = q->que;
+         io_devs(dev->code),
+         dev->buf[BUF_A], dev->buf[BUF_B], dev->buf[BUF_C],
+           dev->busy? 'B' : ' ',
+           dev->done? 'D' : ' ',
+         dev->intdis? 'I' : ' ',
+         dev->intreq? 'R' : ' ',
+         dev->line,
+         dev->delay, evt->timeout,
+         ctrlfns[evt->ctrlfn]);
+      evt = evt->que;
    }
 }
 
