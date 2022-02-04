@@ -4,7 +4,8 @@
  *
 */
 
-int DBG=0;
+/* #define DBG(x)    x */
+#define DBG(x)
 
 #define VER_VER   0
 #define VER_REL   0
@@ -40,6 +41,38 @@ void Assert(char *path,int lno, char *msg, int cond)
 }
 #define ASSERT(cond) Assert(__FILE__,__LINE__,""#cond,cond)
 
+enum {
+   H_Run,
+   H_Startup,
+   H_Halt,
+   H_Break,
+   H_Undef,
+   H_Indir,
+   H_MisDev,
+   H_IOErr,
+   H_ReadOnly
+} Halt;
+
+char *halts[] = {
+   "run",
+   "system startup",
+   "halt",
+   "break",
+   "undefined instruction",
+   "indirection chain",
+   "missing device",
+   "I/O error",
+   "drive read-only"
+};
+
+void SetHalt(char *path,int lno,int n)
+{
+   DBG(fprintf(stderr,"%s:%d: Halt = %d\n",path,lno,n));
+   Halt = n;
+}
+
+#define HALT(x)   SetHalt(__FILE__,__LINE__,x)
+
 typedef struct _Option {
    Byte devno;
    char *key;
@@ -54,16 +87,19 @@ void disasm(Word IR);
 char *io_devs(Byte devno);
 Word memReadIO(Word adr);
 void memWriteIO(Word adr, Word w);
+void showsym(int vc);
 
 Word AC[4], PC;                                 /* registers: ACs, PC */
 Flag CRY;                                       /* carry */
 
 Word M[32768];                                  /* memory */
+int  T[32768];
 Byte* B;                                        /* byte addressed memory */
 
 /* --- D E V I C E S -------------------------------------------------------- */
 
-#define SEC_SIZE  512
+#define SEC_SIZE  256
+#define SEC_BYTES 512
 #define NDEV      0100
 
 #define DEV_MDV   (001)
@@ -222,30 +258,7 @@ int IREQ;            /* no. of pending INT requests */
 Flag delayION;       /* delayed ION */
 Device devs[64];
 Flag MissingDev;     /* allow/disallow missing devices */
-
-enum {
-   H_Run,
-   H_Startup,
-   H_Halt,
-   H_Break,
-   H_Undef,
-   H_Indir,
-   H_MisDev,
-   H_IOErr,
-   H_ReadOnly
-} Halt;
-
-char *halts[] = {
-   "run",
-   "system startup",
-   "halt",
-   "break",
-   "undefined instruction",
-   "indirection chain",
-   "missing device",
-   "I/O error",
-   "drive read-only"
-};
+Flag Trace;          /* trace instr. execution         */
 
 int  nBKPT;  /* breakpoints */
 #define MAX_BKPT   8
@@ -446,7 +459,7 @@ void devOUT(Byte devno, int reg, Word w)        /* Device OUTPUT */
          }
          break;
       case BUF_C:                               /* HALT */
-         Halt = H_Halt;                         /* Halt the processor. */
+         HALT(H_Halt);                          /* Halt the processor. */
          break;
       }
       break;
@@ -503,7 +516,7 @@ int lockDEV(Device *dev)
    ASSERT(NULL != dev->units[0].fd);            /* ensure fd      */
 
    if (-1 == flock(fileno(dev->units[0].fd), LOCK_EX)) {/* failed to lock? */
-      Halt = H_IOErr;                           /*    I/O error   */
+      HALT(H_IOErr);                            /*    I/O error   */
       return 1;                                 /*    HALT        */
    }
    dev->locked = true;                          /* mark locked    */
@@ -521,7 +534,7 @@ void unlockDEV(Device *dev)
    dev->locked   = false;                       /* clear locked status  */
    dev->unlockTO = 0;                           /* clear unlock timeout */
    if (-1 == flock(fileno(dev->units[0].fd), LOCK_UN))/* failed to unlock? */
-      Halt = H_IOErr;                           /*    HALT     */
+      HALT(H_IOErr);                            /*    HALT     */
 }
 
 int initDSK(Device *dev, CtrlFn *pCtrlfn)        /* Init DSK operation */
@@ -574,12 +587,12 @@ Exit:
 
 void doioDSK(Device *dev, Event *evt)           /* Perform DSK I/O   */
 {
-   Word buf[256];
+   Word buf[SEC_SIZE];
    int  i;
    Word sector;
 
    if (IOC_PULSE == evt->ctrlfn) {              /* was a WRITE?   */
-      for (i = 0; i < 256; i++)                 /* read words     */
+      for (i = 0; i < SEC_SIZE; i++)            /* read words     */
          buf[i] = memReadIO(dev->DSK_ACNT + i); /* from memory*/
    }
    sector = (017777 & dev->DSK_DTS);            /* calc. sector */
@@ -587,22 +600,22 @@ void doioDSK(Device *dev, Event *evt)           /* Perform DSK I/O   */
    case IOC_NONE:                               /* delayed error */
       break;
    case IOC_START:                              /* do READ */
-      for (i = 0; i < 256; i++)
+      for (i = 0; i < SEC_SIZE; i++)
          buf[i] = dev->mem[sector + i];
       break;
    case IOC_CLEAR:
       ASSERT(true);                             /* cannot be Clear */
       break;
    case IOC_PULSE:                              /* do WRITE */
-      for (i = 0; i < 256; i++)
+      for (i = 0; i < SEC_SIZE; i++)
          dev->mem[sector + i] = buf[i];
       break;
    }
    if (IOC_START == evt->ctrlfn) {              /* was a READ? */
-      for (i = 0; i < 256; i++)                 /* write words */
+      for (i = 0; i < SEC_SIZE; i++)            /* write words */
          memWriteIO(dev->DSK_ACNT + i, buf[i]); /* to memory*/
    }
-   dev->DSK_ACNT += 256;                        /* update address cnt */
+   dev->DSK_ACNT += SEC_SIZE;                   /* update address cnt */
    if (IOC_PULSE == evt->ctrlfn)                /* was a WRITE?       */
       dev->DSK_ACNT += 2;                       /*    ahead 2 words   */
    dev->u.DSK.lastDTS = dev->DSK_DTS;           /* save last sector   */
@@ -685,6 +698,7 @@ int initDKP(Device *dev, int uno, CtrlFn *pCtrlfn)/* Init DKP operation */
       dev->delay = delay;
       break;
    }
+   return 0;
 
 ErrOut:
    if (dev->status) {                           /* any error?     */
@@ -700,7 +714,7 @@ void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
 {
    Byte uno, scnt;
    off_t offs;
-   Word buf[256];
+   Word buf[SEC_SIZE];
    Word acnt, dmc, dss;
    int  i, n, mode, sic;
 
@@ -721,35 +735,40 @@ void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
          ASSERT(true);
       acnt = dev->DKP_ACNT;                     /* get address counter */
       scnt = DKP_SCNT(dss);                     /* get sector counter  */
+DBG(fprintf(stderr,"PC=%06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
+         PC,mode,acnt,scnt,DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
       offs =                     DKP_CYL(dmc);  /* calc. offset        */
       offs = DKP_GEO_HH * offs + DKP_HED(dss);
       offs = DKP_GEO_SS * offs + DKP_SEC(dss);
       if (-1 == fseeko(dev->units[uno].fd, offs, SEEK_CUR)) {
-         Halt = H_IOErr;
+         HALT(H_IOErr);
          return;
       }
       sic  = DKP_GEO_SS * DKP_HED(dss);         /* sector in cylinder  */
       sic += DKP_SEC(dss);
       do {
          if (DKP_MREAD == mode) {               /* handle READ         */
-            n = fread(&buf[0], sizeof(Word), 256, dev->units[uno].fd);
+            n = fread(&buf[0], sizeof(Word), SEC_SIZE, dev->units[uno].fd);
             if (n != SEC_SIZE) {                /* I/O failed?         */
-               Halt = H_IOErr;                  /*    HALT             */
+               HALT(H_IOErr);                   /*    HALT             */
                return;
             }
-            for (i = 0; i < 256; i++)           /* write buffer to     */
+DBG(fprintf(stderr,"W:%06o\n",acnt));
+            for (i = 0; i < SEC_SIZE; i++)      /* write buffer to     */
                memWriteIO(acnt++, buf[i]);      /*    memory           */
          }
          else if (DKP_MWRITE == mode) {         /* handle WRITE        */
-            for (i = 0; i < 256; i++)           /* read buffer from    */
+DBG(fprintf(stderr,"R:%06o\n",acnt));
+            for (i = 0; i < SEC_SIZE; i++)      /* read buffer from    */
                buf[i] = memReadIO(acnt++);      /*    memory           */
-            n = fwrite(&buf[0], sizeof(Word), 256, dev->units[uno].fd);
+            n = fwrite(&buf[0], sizeof(Word), SEC_SIZE, dev->units[uno].fd);
             if (n != SEC_SIZE) {                /* I/O failed?         */
-               Halt = H_IOErr;                  /*    HALT             */
+               HALT(H_IOErr);                   /*    HALT             */
                return;
             }
          }
          scnt = 017 & (scnt + 1);               /* incr. sector count   */
+DBG(fprintf(stderr,"scnt=%o\n",scnt));
          sic++;                                 /* incr. sector in cylinder*/
          if ((DKP_GEO_HH * DKP_GEO_SS) == sic) {/* end of cylinder? */
             dev->status |= DKP_E_END;           /*    report END error  */
@@ -779,13 +798,13 @@ void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
       if (DKP_MRECAL == mode)
          dev->units[uno].DKP_DMC = 0;
       else if (DKP_MSEEK == mode) {
-         offs  = SEC_SIZE;
+         offs  = SEC_BYTES;
          offs *= DKP_GEO_HH * DKP_GEO_SS * DKP_CYL(dev->units[uno].DKP_DMC);
       }
       else
          ASSERT(true);                          /* fail in other Modes */
       if (-1 == fseeko(dev->units[uno].fd, offs, SEEK_SET)) /* I/O error? */
-         Halt = H_IOErr;                        /*    HALT             */
+         HALT(H_IOErr);                         /*    HALT             */
       dev->status &= ~DKP_SEEKING(uno);         /* clear Seeking flag  */
       dev->status |= DKP_DONE_SEEK(uno);        /* set Seeking Done    */
       break;
@@ -818,7 +837,7 @@ void devStart(Byte devno)                       /* Start device `dev' */
          uno = DKP_DRV(dev->DKP_DSS);
       if (!dev->units[uno].fd) {                /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
-            Halt = H_MisDev;                    /*    HALT           */
+            HALT(H_MisDev);                     /*    HALT           */
          return;
       }
       break;
@@ -985,11 +1004,11 @@ void devPulse(Byte devno)                       /* Pulse device `dev' */
          uno = DKP_DRV(dev->DKP_DSS);
       if (!dev->units[uno].fd) {                /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
-            Halt = H_MisDev;                    /*    HALT           */
+            HALT(H_MisDev);                     /*    HALT           */
          return;
       }
       if (dev->units[uno].rdonly) {             /* drive read-only?  */
-         Halt = H_ReadOnly;                     /*    HALT           */
+         HALT(H_ReadOnly);                      /*    HALT           */
          return;
       }
       break;
@@ -1042,7 +1061,7 @@ int readChar(Device *dev)
    if (EOF == ch) {
       ch = 0;
       if (!feof(dev->units[0].fd))
-         Halt = H_IOErr;
+         HALT(H_IOErr);
    }
    return ch;
 }
@@ -1057,7 +1076,7 @@ void writeChar(Device *dev, int ch)
    buf[0] = ch;
    n = fwrite(buf, sizeof(char), 1, dev->units[0].fd);
    if (1 != n)
-      Halt = H_IOErr;
+      HALT(H_IOErr);
 }
 
 void devDone(Event *evt)                       /* Device done, ie timed out */
@@ -1140,7 +1159,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
                    dev->u.LPT.pos,
                    dev->units[0].fd);
             if (n != dev->u.LPT.pos)            /* check chars written */
-               Halt = H_IOErr;                  /*    error if less    */
+               HALT(H_IOErr);                   /*    error if less    */
             dev->u.LPT.pos = 0;                 /* reset position */
             if (LPT_NZONE == dev->u.LPT.zone || LPT_CTRL == op)
                                                 /* last zone OR CtrlOp? */
@@ -1158,7 +1177,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
          unlockDEV(dev);
       break;
    case DEV_DKP:                                /* DKP? */
-      doioDSK(dev, evt);                        /*    perform I/O */
+      doioDKP(dev, evt);                        /*    perform I/O */
       if (dev->locked) {
          ASSERT(IOC_NONE != evt->ctrlfn);       /* ensure unlocked if no I/O */
          if (IOC_START == evt->ctrlfn)          /* was a Read/Write? */
@@ -1168,9 +1187,11 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
    }
 
    if (true == dev->done                        /* Done set?                */
-       && false == dev->intdis)                 /*    and IntDisable clear? */
+       && false == dev->intdis                  /*    AND IntDisable clear? */
+       && false == dev->intreq)                 /*    AND IntReq clear?     */
    {
       dev->intreq = true; IREQ++;               /* trigger an INT request */
+DBG(fprintf(stderr,"%02o: IntReq\n",dev->devno));
    }
 }
 
@@ -1192,6 +1213,7 @@ void doIO(int dt)                               /* Do Input/Output   */
       q = QUE; QUE = q->que;                    /* remove device from queue */
       q->que = NULL;                            /* ensure ptr cleared       */
       devDone(q);                               /* do actual I/O            */
+      clearEVT(q);                              /* clear event record       */
    }
 
    ioTime = elapsedTime;                        /* reset ioTime            */
@@ -1213,10 +1235,10 @@ void finish(void)
          goto LCloseAll;
       }
       nbytes = fwrite(dev->mem,                 /* write out data */
-                     SEC_SIZE,
+                     SEC_BYTES,
                      dev->units[0].nsecs,
                      dev->units[0].fd);
-      if (nbytes != SEC_SIZE * dev->units[0].nsecs) { /* check bytes written */
+      if (nbytes != dev->units[0].nsecs) {      /* check bytes written */
          fprintf(stderr,"fwrite(): %s!\n",dev->units[0].path);
          goto LCloseAll;
       }
@@ -1345,11 +1367,11 @@ void initDevs(int nopts, Option *opts)
          case DEV_LPT:
             mode = "ab"; break;
          case DEV_DSK:
-            mode = "w+b"; break;
+            mode = "r+b"; break;
          case DEV_DKP:
             uno = keyIndex(opt->key, "file");   /* get drive no.  */
             if (uno < 0 || uno > 3) goto ErrOut;/* max 4 drives   */
-            mode = "w+b"; break;
+            mode = "r+b"; break;
          default: break;
          }
          if (!mode) goto ErrOut;
@@ -1372,7 +1394,7 @@ void initDevs(int nopts, Option *opts)
                fprintf(stderr,"ftello(): %s!\n",opt->value);
                exit(1);
             }
-            nsecs = nsecs / SEC_SIZE;
+            nsecs = nsecs / SEC_BYTES;
             errmsg = NULL;
             if (DEV_DSK == opt->devno) {
                if (nsecs < 256 || nsecs > 65536)
@@ -1398,13 +1420,13 @@ void initDevs(int nopts, Option *opts)
          }
          if (DEV_DSK == devno) {
             long nsecs;
-            dev->mem = (Word*)malloc(dev->units[uno].nsecs * SEC_SIZE);
+            dev->mem = (Word*)malloc(dev->units[uno].nsecs * SEC_BYTES);
             if (NULL == dev->mem) {
                fprintf(stderr,"malloc(): not enough memory (%s)!\n",opt->value);
                exit(1);
             }
-            nsecs = fread(dev->mem, SEC_SIZE, dev->units[uno].nsecs, dev->units[uno].fd);
-            if (nsecs != SEC_SIZE * dev->units[uno].nsecs) {
+            nsecs = fread(dev->mem, SEC_BYTES, dev->units[uno].nsecs, dev->units[uno].fd);
+            if (nsecs != dev->units[uno].nsecs) {
                fprintf(stderr,"fdread(): %s!\n",opt->value);
                exit(1);
             }
@@ -1505,14 +1527,18 @@ void memWrite(Word adr, Word w)
 
 Word memReadIO(Word adr)
 {
+   adr &= 077777;
+/*fprintf(stderr,"R:%06o/%06o\n",adr,M[adr]);*/
    /* I/O memory read when time alread lapsed ! */
-   return M[077777 & adr];
+   return M[adr];
 }
 
 void memWriteIO(Word adr, Word w)
 {
+   adr &= 077777;
+/*fprintf(stderr,"W:%06o/%06o\n",adr,w);*/
    /* I/O memory write, when time already lapsed ! */
-   M[077777 & adr] = w;
+   M[adr] = w;
 }
 
 Word memRead(Word adr)
@@ -1618,7 +1644,7 @@ Word indirectChain(Word E, int indir)
          indir = 0100000 & E? 1 : 0;
       E &= 077777;
       if (++cnt > 16) {
-         Halt = H_Indir;
+         HALT(H_Indir);
          return 0;
       }
    }
@@ -1661,6 +1687,9 @@ void waitIO(void)
 
 void execute(Word IR)
 {
+   if (Trace)                                   /* trace execution?      */
+      showsym(0);                               /*    show symbolic inst.*/
+
    if (KIPS && numInstr >= syncInstr)           /* if KIPS set,          */
       syncKIPS();                               /* sync instruction time */
 
@@ -1908,7 +1937,7 @@ void step(void)
    execute(IR);
 
    if (nBKPT && BRAKE(PC)) {
-      Halt = H_Break; return;
+      HALT(H_Break); return;
    }
 }
 
@@ -1964,14 +1993,17 @@ void load(void)
    Word w, DIAS;
    int i;
 
+   DIAS = (077 & SW) + 060500;
    for (i = 0; i < 32; i++)
       M[i] = bootstrap[i];
-   return;
+
+   PC = 0;
+   AC[0] = (077 & SW) << 1;
+   run();
+
+#if 0
 
    /* SuperNova-style loader */
-   DIAS = (077 & SW) + 060500;
-
-   execute(062677); /* IORST */
    if (0100000 & SW) {
       execute(DIAS);
       memWrite(0377, 0377);
@@ -1998,6 +2030,8 @@ void load(void)
    }
    PC = 040; AC[0] = (077 & SW) << 1;
    run();
+#endif
+
 }
 
 /* --- V I R T U A L  C O N S O L E ----------------------------------------- */
@@ -2262,14 +2296,22 @@ void dispcell(Word w)
    }
 }
 
-void showregs(int nl)
+void showregs(int vc,int nl)
 {
-   printf("PC: %06o   ACs: %06o %06o %06o %06o  %s%s",
-         IC[IC_PC],
-         IC[IC_AC0],IC[IC_AC1],IC[IC_AC2],IC[IC_AC3],
-         IC[IC_CRY]? "C":" ",
-         IC[IC_ION]? "I":" "
-   );
+   if (vc)
+      printf("PC: %06o   ACs: %06o %06o %06o %06o  %s%s",
+            IC[IC_PC],
+            IC[IC_AC0],IC[IC_AC1],IC[IC_AC2],IC[IC_AC3],
+            IC[IC_CRY]? "C":" ",
+            IC[IC_ION]? "I":" "
+      );
+   else
+      printf("PC: %06o   ACs: %06o %06o %06o %06o  %s%s",
+            PC,
+            AC[0],AC[1],AC[2],AC[3],
+            CRY? "C":" ",
+            ION? "I":" "
+      );
    if (nl) printf("\n");
 }
 
@@ -2281,12 +2323,19 @@ void show(int cello,int adr)
    printf("  ");
 }
 
-void showsym(void)
+void showsym(int vc)
 {
    Word IR;
+   Word adr;
 
-   IR = M[077777 & PC];
-   showregs(0);
+   adr = 077777 & PC;
+   if (!vc) {
+      if (T[adr] > 10)
+         return;
+      T[adr]++;
+   }
+   IR = M[adr];
+   showregs(vc,0);
    printf("  %06o  ",IR);
    disasm(IR);
    printf("\n");
@@ -2364,6 +2413,7 @@ void usage(void)
    printf("   P          proceed\n");
    printf("   [expr]Q    quit YaNOVA\n");
    printf("   <expr>R    run\n");
+   printf("   T          set/clear instr. trace\n");
    printf("   <expr>X    modify device delay [1..100000] uS\n");
    printf("   [expr]Z    set/display KIPS (#instr/mS)\n");
    printf("   ?          display help\n");
@@ -2420,18 +2470,20 @@ void vconsole(void)
    int  xx;    /* value of <expr> */
    char line[80], *cmd;
 
-   H = NULL;
+   H = NULL; Trace = false;
    dly = cello = 0; cellFmt = '=';
    err = 0;
    for(;;) {
       if (Halt) {
          printf("<%s>\n",halts[Halt]);
-         showsym();
-         Halt = H_Run;
+         regs2ic();
+         showsym(1);
+         HALT(H_Run);
       }
       if (err) {
          printf("?\n");
          cello = dly = 0;
+         err = 0;
       }
       printf("! ");
       if (cello) show(cello, adr);
@@ -2440,11 +2492,11 @@ void vconsole(void)
          exit(0);
 
       cmd = line;
-if (DBG) fprintf(stderr,"cmd = [%s]\n",cmd);
+DBG(fprintf(stderr,"cmd = [%s]\n",cmd));
       while (isspace(*cmd)) cmd++;
-if (DBG) fprintf(stderr,"isspace cmd = [%s]\n",cmd);
+DBG(fprintf(stderr,"isspace cmd = [%s]\n",cmd));
       cmd = getexpr(cmd, &xpr, &xx);
-if (DBG) fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx);
+DBG(fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
       if (dly) {
          if (xpr) {
             if (0 < xx && xx <= 100000)
@@ -2462,9 +2514,10 @@ if (DBG) fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx);
             if (cello < 0) IC[adr] = x;
             else M[adr] = x;
          }
-if (DBG) fprintf(stderr,"cello cmd=[%s]\n",cmd);
+DBG(fprintf(stderr,"cello cmd=[%s]\n",cmd));
          switch (*cmd) {
          case  '!': cello = 0; break;
+         case ASC_LF:
          case '\0': adr = (adr + 1); break;       /* CR */
          case  '^': adr = (adr - 1); break;
          case  '@': adr = cello<0? IC[adr] : M[adr];
@@ -2487,11 +2540,11 @@ if (DBG) fprintf(stderr,"cello cmd=[%s]\n",cmd);
          err = 1; continue;
       }
 
-if (DBG) fprintf(stderr,"switch cmd = [%s]\n",cmd);
+DBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
       switch (*cmd++) {
       case 'A': /* open internal cell */
          if (xpr) { cello = -1; adr = x; }
-         else showregs(1);
+         else showregs(1,1);
          break;
       case '/': /* open memory cell */
          cello = 1; adr = x;
@@ -2568,7 +2621,7 @@ if (DBG) fprintf(stderr,"switch cmd = [%s]\n",cmd);
          if (!xpr) x = 1;
          ic2regs();
          for (i = 0; (i < x) && !Halt; i++) {
-            step(); showsym();
+            step(); showsym(0);
          }
          regs2ic();
          break;
@@ -2580,6 +2633,10 @@ if (DBG) fprintf(stderr,"switch cmd = [%s]\n",cmd);
       case 'R': /* run */
          IC[IC_PC] = 077777 & x;
          ic2regs(); run(); regs2ic();
+         break;
+      case 'T': /* set/clear instr. trace */
+         Trace = Trace? false : true;
+         printf("trace = %d\n", Trace);
          break;
       case 'X': /* modify device delay */
          adr = 077 & x;
@@ -2703,10 +2760,12 @@ int main(int argc, char*argv[])
    initOpts(argc, argv);
 
    srandom(1969);
-   for (i = 0; i < sizeof(M) / sizeof(Word); i++)
+   for (i = 0; i < sizeof(M) / sizeof(Word); i++) {
       M[i] = random() & 0177777;
+      T[i] = 0;
+   }
 
-   Halt = H_Startup;
+   HALT(H_Startup);
    vconsole();
 
    return 0;
