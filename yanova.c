@@ -6,6 +6,7 @@
 
 /* #define DBG(x)    x */
 #define DBG(x)
+#define VCDBG(x)
 
 #define VER_VER   0
 #define VER_REL   0
@@ -31,6 +32,11 @@ typedef unsigned long Tyme;                     /* time measured in 0.1us */
 
 
 #define ABS(x)    ((x)<0? -(x):(x))
+
+Word SWAP(Word x)
+{
+   return ((x & 0377) << 8) + (x >> 8);
+}
 
 void Assert(char *path,int lno, char *msg, int cond)
 {
@@ -180,6 +186,7 @@ typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
 #define DKP_GEO_CC   203
 #define DKP_GEO_HH     2
 #define DKP_GEO_SS    12
+#define DKP_GEO_HHSS (DKP_GEO_HH * DKP_GEO_SS)
 
 typedef struct _Event {
    Byte devno;       /* device number */
@@ -258,7 +265,7 @@ int IREQ;            /* no. of pending INT requests */
 Flag delayION;       /* delayed ION */
 Device devs[64];
 Flag MissingDev;     /* allow/disallow missing devices */
-Flag Trace;          /* trace instr. execution         */
+Word Trace;          /* trace instr. execution         */
 
 int  nBKPT;  /* breakpoints */
 #define MAX_BKPT   8
@@ -660,8 +667,10 @@ int initDKP(Device *dev, int uno, CtrlFn *pCtrlfn)/* Init DKP operation */
    case IOC_START:                              /* Read/Write */
       if (DKP_MREAD == mode || DKP_MWRITE == mode){/* Read/Write? */
          sector = DKP_SEC(dev->DKP_DSS);        /* get sector          */
-         if (sector > (DKP_GEO_SS-1))           /* no such sector?     */
+         if (sector > (DKP_GEO_SS-1)) {         /* no such sector?     */
+DBG(fprintf(stderr,"%06o %02o FOREVER\n",PC,dev->devno));
             dev->delay = FOREVER;               /*    it takes forever */
+         }
          else {
             dev->delay = 3334;                  /* actual xfer: 2840us */
             if (dev->units[uno].lastRW) {       /* no seek since last R/W? */
@@ -735,7 +744,7 @@ void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
          ASSERT(true);
       acnt = dev->DKP_ACNT;                     /* get address counter */
       scnt = DKP_SCNT(dss);                     /* get sector counter  */
-DBG(fprintf(stderr,"PC=%06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
+DBG(fprintf(stderr,"IODONE %06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
          PC,mode,acnt,scnt,DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
       offs =                     DKP_CYL(dmc);  /* calc. offset        */
       offs = DKP_GEO_HH * offs + DKP_HED(dss);
@@ -753,14 +762,12 @@ DBG(fprintf(stderr,"PC=%06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
                HALT(H_IOErr);                   /*    HALT             */
                return;
             }
-DBG(fprintf(stderr,"W:%06o\n",acnt));
             for (i = 0; i < SEC_SIZE; i++)      /* write buffer to     */
-               memWriteIO(acnt++, buf[i]);      /*    memory           */
+               memWriteIO(acnt++, SWAP(buf[i]));/*    memory           */
          }
          else if (DKP_MWRITE == mode) {         /* handle WRITE        */
-DBG(fprintf(stderr,"R:%06o\n",acnt));
             for (i = 0; i < SEC_SIZE; i++)      /* read buffer from    */
-               buf[i] = memReadIO(acnt++);      /*    memory           */
+               buf[i] = SWAP(memReadIO(acnt++));/*    memory           */
             n = fwrite(&buf[0], sizeof(Word), SEC_SIZE, dev->units[uno].fd);
             if (n != SEC_SIZE) {                /* I/O failed?         */
                HALT(H_IOErr);                   /*    HALT             */
@@ -768,19 +775,32 @@ DBG(fprintf(stderr,"R:%06o\n",acnt));
             }
          }
          scnt = 017 & (scnt + 1);               /* incr. sector count   */
-DBG(fprintf(stderr,"scnt=%o\n",scnt));
-         sic++;                                 /* incr. sector in cylinder*/
-         if ((DKP_GEO_HH * DKP_GEO_SS) == sic) {/* end of cylinder? */
-            dev->status |= DKP_E_END;           /*    report END error  */
-            break;
+         /* "When the sector count reaches zero, the control terminates
+          *  the command (with the counters pointing to the last block
+          *  processed" pp. 5-10
+         */
+         if (scnt) {
+            sic++;                              /* incr. sector in cylinder*/
+            if (DKP_GEO_HHSS == sic) {          /* end of cylinder? */
+               dev->status |= DKP_E_END;        /*    report END error  */
+               break;
+            }
          }
       } while (0 != scnt);
 
       dev->units[uno].lastRW  = elapsedTime;    /* save lastRW and */
       dev->units[uno].lastSEC = sic % DKP_GEO_SS;  /*    position  */
 
-                                                /* update sector counter  */
-      dev->units[uno].DKP_DSS = (0177760 & dss) + scnt;
+                                                /* update DSS      */
+      dss &= 0177000;                           /* clear Surf/Sec/SCnt*/
+      if (sic == DKP_GEO_HHSS)                  /* update Surf/Sec */
+         sic = 0;
+      if (sic > (DKP_GEO_SS-1)) {
+         dss |= 0400; sic -= DKP_GEO_SS;
+      }
+      dss |= (017 & sic) << 4;
+      dss |= scnt;                              /* update SCnt     */
+      dev->units[uno].DKP_DSS = dss;
       if (DKP_MWRITE == mode)                   /* adjust adr counter     */
          acnt += 2;                             /*    if WRITE            */
       dev->DKP_ACNT = 077777 & acnt;            /* update adr counter     */
@@ -799,7 +819,7 @@ DBG(fprintf(stderr,"scnt=%o\n",scnt));
          dev->units[uno].DKP_DMC = 0;
       else if (DKP_MSEEK == mode) {
          offs  = SEC_BYTES;
-         offs *= DKP_GEO_HH * DKP_GEO_SS * DKP_CYL(dev->units[uno].DKP_DMC);
+         offs *= DKP_GEO_HHSS * DKP_CYL(dev->units[uno].DKP_DMC);
       }
       else
          ASSERT(true);                          /* fail in other Modes */
@@ -928,6 +948,8 @@ void devStart(Byte devno)                       /* Start device `dev' */
       dev->busy = true;                         /* Busy=1,Done=0 */
       dev->done = false;
 
+      DBG(fprintf(stderr,"IOSTAR %06o %02o ctrlfn=%d delay=%d\n",
+            PC,dev->devno,ctrlfn,dev->delay));
       enqueIO(dev, uno, ctrlfn);                /* enqueue I/O */
    }
 }
@@ -981,6 +1003,9 @@ void devClear(Byte devno)                       /* Clear device `dev' */
 
    dev->busy = false;                           /* clear control FFs */
    dev->done = false;
+
+   DBG(fprintf(stderr,"IOCLER %06o %02o ctrlfn=%d\n",
+               PC,dev->devno,IOC_CLEAR));
 
    if (dev->intreq) {                           /* INT request pending?  */
       dev->intreq = false; IREQ--;              /* clear dev and CPU flag*/
@@ -1046,6 +1071,9 @@ void devPulse(Byte devno)                       /* Pulse device `dev' */
       dev->busy = true;                        /* Busy=1,Done=0 */
    dev->done = false;
 
+   DBG(fprintf(stderr,"IOPULS %06o %02o ctrlfn=%d delay=%d\n",
+               PC,dev->devno,ctrlfn,dev->delay));
+
    enqueIO(dev, uno, ctrlfn);
 
    return;
@@ -1083,6 +1111,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
 {
    int ch;
    Device *dev;
+   Flag done;
 
    dev = &devs[evt->devno];                     /* get device data   */
 
@@ -1096,6 +1125,12 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
       /* xmit char - does NOT set done, otherwise set done */
       dev->done = LPT_XMIT == dev->u.LPT.op? false : true;
       dev->busy = false;
+      break;
+   case DEV_DKP:
+      if (IOC_START == evt->ctrlfn) {           /* Seek/Recalibrate does */
+         dev->done = true;                      /*    NOT set Done       */
+         dev->busy = false;
+      }
       break;
    default:
       dev->done = true;                         /* Done=1,Busy=0  */
@@ -1186,12 +1221,20 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
       break;
    }
 
-   if (true == dev->done                        /* Done set?                */
+   done = dev->done;
+   if (DEV_DKP == dev->devno                    /* DKP? */
+       && IOC_PULSE == evt->ctrlfn)             /*    Seek/Recalibrate?     */
+   {
+      if (0 != (074000 & dev->status))          /* any Seek Done flag set?  */
+         done = true;                           /*    trigger INT           */
+   }
+
+   if (done                                     /* Done set?                */
        && false == dev->intdis                  /*    AND IntDisable clear? */
        && false == dev->intreq)                 /*    AND IntReq clear?     */
    {
       dev->intreq = true; IREQ++;               /* trigger an INT request */
-DBG(fprintf(stderr,"%02o: IntReq\n",dev->devno));
+DBG(fprintf(stderr,"IOIREQ %06o %02o\n",PC,dev->devno));
    }
 }
 
@@ -1234,6 +1277,8 @@ void finish(void)
          fprintf(stderr,"fseek(): %s!\n",devs->units[0].path);
          goto LCloseAll;
       }
+      for (i = 0; i < dev->units[0].nsecs * SEC_SIZE; i++)
+         dev->mem[i] = SWAP(dev->mem[i]);
       nbytes = fwrite(dev->mem,                 /* write out data */
                      SEC_BYTES,
                      dev->units[0].nsecs,
@@ -1430,6 +1475,8 @@ void initDevs(int nopts, Option *opts)
                fprintf(stderr,"fdread(): %s!\n",opt->value);
                exit(1);
             }
+            for (i = 0; i < nsecs * SEC_SIZE; i++)
+               dev->mem[i] = SWAP(dev->mem[i]);
          }
          continue;
       }
@@ -1522,6 +1569,7 @@ void memWrite(Word adr, Word w)
    ASSERT(adr < 0100000);
 
    M[adr] = w;
+   if (Trace) T[adr] = 0;
    cycle();
 }
 
@@ -1539,6 +1587,7 @@ void memWriteIO(Word adr, Word w)
 /*fprintf(stderr,"W:%06o/%06o\n",adr,w);*/
    /* I/O memory write, when time already lapsed ! */
    M[adr] = w;
+   if (Trace) T[adr] = 0;
 }
 
 Word memRead(Word adr)
@@ -1880,17 +1929,18 @@ void execute(Word IR)
          E = disp;
          break;
       case 1: /* PC-relative */
-         E = 077777 & (disp + PC);
+         E = disp + PC;
          break;
       case 2: /* AC2 indexed */
-         E = 077777 & (disp + AC[2]);
+         E = disp + AC[2];
          break;
       case 3: /* AC3 indexed */
-         E = 077777 & (disp + AC[3]);
+         E = disp + AC[3];
          break;
       }
 
-      E = indirectChain(E, indir);
+      E &= 077777;
+      E  = indirectChain(E, indir);
       if (Halt)
          return;
 
@@ -1926,7 +1976,7 @@ void execute(Word IR)
          break;
       }
    }
-   PC = 07777 & (PC + 1);
+   PC = 077777 & (PC + 1);
 }
 
 void step(void)
@@ -2330,7 +2380,7 @@ void showsym(int vc)
 
    adr = 077777 & PC;
    if (!vc) {
-      if (T[adr] > 10)
+      if (T[adr] >= Trace)
          return;
       T[adr]++;
    }
@@ -2413,7 +2463,7 @@ void usage(void)
    printf("   P          proceed\n");
    printf("   [expr]Q    quit YaNOVA\n");
    printf("   <expr>R    run\n");
-   printf("   T          set/clear instr. trace\n");
+   printf("   [expr]T    set/clear instr. trace\n");
    printf("   <expr>X    modify device delay [1..100000] uS\n");
    printf("   [expr]Z    set/display KIPS (#instr/mS)\n");
    printf("   ?          display help\n");
@@ -2470,7 +2520,7 @@ void vconsole(void)
    int  xx;    /* value of <expr> */
    char line[80], *cmd;
 
-   H = NULL; Trace = false;
+   H = NULL; Trace = 0;
    dly = cello = 0; cellFmt = '=';
    err = 0;
    for(;;) {
@@ -2492,11 +2542,11 @@ void vconsole(void)
          exit(0);
 
       cmd = line;
-DBG(fprintf(stderr,"cmd = [%s]\n",cmd));
+VCDBG(fprintf(stderr,"cmd = [%s]\n",cmd));
       while (isspace(*cmd)) cmd++;
-DBG(fprintf(stderr,"isspace cmd = [%s]\n",cmd));
+VCDBG(fprintf(stderr,"isspace cmd = [%s]\n",cmd));
       cmd = getexpr(cmd, &xpr, &xx);
-DBG(fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
+VCDBG(fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
       if (dly) {
          if (xpr) {
             if (0 < xx && xx <= 100000)
@@ -2514,7 +2564,7 @@ DBG(fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
             if (cello < 0) IC[adr] = x;
             else M[adr] = x;
          }
-DBG(fprintf(stderr,"cello cmd=[%s]\n",cmd));
+VCDBG(fprintf(stderr,"cello cmd=[%s]\n",cmd));
          switch (*cmd) {
          case  '!': cello = 0; break;
          case ASC_LF:
@@ -2540,7 +2590,7 @@ DBG(fprintf(stderr,"cello cmd=[%s]\n",cmd));
          err = 1; continue;
       }
 
-DBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
+VCDBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
       switch (*cmd++) {
       case 'A': /* open internal cell */
          if (xpr) { cello = -1; adr = x; }
@@ -2635,8 +2685,8 @@ DBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
          ic2regs(); run(); regs2ic();
          break;
       case 'T': /* set/clear instr. trace */
-         Trace = Trace? false : true;
-         printf("trace = %d\n", Trace);
+         if (xpr) { Trace = xx; }
+         printf("trace = %o\n", Trace);
          break;
       case 'X': /* modify device delay */
          adr = 077 & x;
@@ -2648,7 +2698,7 @@ DBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
          }
          break;
       case 'Z': /* set/display KIPS */
-         if (xpr && (0 < x))
+         if (xpr && (0 <= x))
             KIPS = x;
          printf("KIPS = %d\n", KIPS);
          break;

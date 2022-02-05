@@ -9,6 +9,7 @@ Options:
   * set disc controller shared, -DEVshared=0|1
 
 Changes:
+  * instruction trace
   * DKP controller (not debugged), unlock timeout
   * standalone event queue, each device can fire multiple events
   * shared disc controllers
