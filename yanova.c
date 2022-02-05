@@ -33,10 +33,14 @@ typedef unsigned long Tyme;                     /* time measured in 0.1us */
 
 #define ABS(x)    ((x)<0? -(x):(x))
 
+#if 1
+#define SWAP(x)   x
+#else
 Word SWAP(Word x)
 {
    return ((x & 0377) << 8) + (x >> 8);
 }
+#endif
 
 void Assert(char *path,int lno, char *msg, int cond)
 {
@@ -73,7 +77,7 @@ char *halts[] = {
 
 void SetHalt(char *path,int lno,int n)
 {
-   DBG(fprintf(stderr,"%s:%d: Halt = %d\n",path,lno,n));
+   DBG(printf("%s:%d: Halt = %d\n",path,lno,n));
    Halt = n;
 }
 
@@ -642,6 +646,9 @@ int initDKP(Device *dev, int uno, CtrlFn *pCtrlfn)/* Init DKP operation */
    dev->status &= 0177700;                      /* clear error flags  */
    mode = DKP_MOD(dev->DKP_DMC);                /* get mode */
 
+DBG(printf("INIDKP %06o %02o ctrlfn=%d mode=%d\n",
+            PC,dev->devno,ctrlfn,mode));
+
    if (IOC_PULSE == ctrlfn && DKP_MSEEK == mode) {
       cylinder = DKP_CYL(dev->DKP_DMC);         /* get target cylinder */
       if (cylinder > (DKP_GEO_CC-1)) {          /* no such cylinder?   */
@@ -668,7 +675,7 @@ int initDKP(Device *dev, int uno, CtrlFn *pCtrlfn)/* Init DKP operation */
       if (DKP_MREAD == mode || DKP_MWRITE == mode){/* Read/Write? */
          sector = DKP_SEC(dev->DKP_DSS);        /* get sector          */
          if (sector > (DKP_GEO_SS-1)) {         /* no such sector?     */
-DBG(fprintf(stderr,"%06o %02o FOREVER\n",PC,dev->devno));
+DBG(printf("%06o %02o FOREVER\n",PC,dev->devno));
             dev->delay = FOREVER;               /*    it takes forever */
          }
          else {
@@ -698,12 +705,14 @@ DBG(fprintf(stderr,"%06o %02o FOREVER\n",PC,dev->devno));
    case IOC_PULSE:                              /* Seek/Recalibrate */
       if (DKP_MRECAL == mode)                   /* Recalibrate? */
          delay = 20000 * DKP_CYL(dev->units[uno].DKP_DMC);/* 20ms * cylinder */
-      else if (DKP_MSEEK == mode)               /* Seek? */
+      else if (DKP_MSEEK == mode)                 /* Seek? */
          delay = 20000 * abs(DKP_CYL(dev->units[uno].DKP_DMC) - DKP_CYL(dev->DKP_DMC));
       else
          return 1;                              /* Read/Write w/ Pulse */
       if (delay > 135000)                       /* max. 135ms   */
          delay = 135000;
+      else if (delay < 20000)
+         delay = 20000;
       dev->delay = delay;
       break;
    }
@@ -744,7 +753,7 @@ void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
          ASSERT(true);
       acnt = dev->DKP_ACNT;                     /* get address counter */
       scnt = DKP_SCNT(dss);                     /* get sector counter  */
-DBG(fprintf(stderr,"IODONE %06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
+DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
          PC,mode,acnt,scnt,DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
       offs =                     DKP_CYL(dmc);  /* calc. offset        */
       offs = DKP_GEO_HH * offs + DKP_HED(dss);
@@ -948,7 +957,7 @@ void devStart(Byte devno)                       /* Start device `dev' */
       dev->busy = true;                         /* Busy=1,Done=0 */
       dev->done = false;
 
-      DBG(fprintf(stderr,"IOSTAR %06o %02o ctrlfn=%d delay=%d\n",
+      DBG(printf("IOSTAR %06o %02o ctrlfn=%d delay=%d\n",
             PC,dev->devno,ctrlfn,dev->delay));
       enqueIO(dev, uno, ctrlfn);                /* enqueue I/O */
    }
@@ -1004,7 +1013,7 @@ void devClear(Byte devno)                       /* Clear device `dev' */
    dev->busy = false;                           /* clear control FFs */
    dev->done = false;
 
-   DBG(fprintf(stderr,"IOCLER %06o %02o ctrlfn=%d\n",
+   DBG(printf("IOCLER %06o %02o ctrlfn=%d\n",
                PC,dev->devno,IOC_CLEAR));
 
    if (dev->intreq) {                           /* INT request pending?  */
@@ -1071,7 +1080,7 @@ void devPulse(Byte devno)                       /* Pulse device `dev' */
       dev->busy = true;                        /* Busy=1,Done=0 */
    dev->done = false;
 
-   DBG(fprintf(stderr,"IOPULS %06o %02o ctrlfn=%d delay=%d\n",
+   DBG(printf("IOPULS %06o %02o ctrlfn=%d delay=%d\n",
                PC,dev->devno,ctrlfn,dev->delay));
 
    enqueIO(dev, uno, ctrlfn);
@@ -1234,7 +1243,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
        && false == dev->intreq)                 /*    AND IntReq clear?     */
    {
       dev->intreq = true; IREQ++;               /* trigger an INT request */
-DBG(fprintf(stderr,"IOIREQ %06o %02o\n",PC,dev->devno));
+DBG(printf("IOIREQ %06o %02o\n",PC,dev->devno));
    }
 }
 
@@ -1875,21 +1884,22 @@ void execute(Word IR)
             devOUT(devno,(tfer-1)/2,AC[ac]);
       }
 
-      switch (ctrl) {
-      case 0: /* Do not activate */
-         break;
-      case 1: /* S start dev */
-         devStart(devno);
-         break;
-      case 2: /* C clear dev */
-         devClear(devno);
-         break;
-      case 3: /* P pulse dev */
-         devPulse(devno);
-         break;
+      if (7 != tfer) {
+         switch (ctrl) {
+         case 0: /* Do not activate */
+            break;
+         case 1: /* S start dev */
+            devStart(devno);
+            break;
+         case 2: /* C clear dev */
+            devClear(devno);
+            break;
+         case 3: /* P pulse dev */
+            devPulse(devno);
+            break;
+         }
       }
-
-      if (0 == tfer || 7 == tfer) {
+      else {
          int cond;
 
          cond = 0;
@@ -2448,26 +2458,27 @@ void usage(void)
 {
    printf("Commands:\n");
    printf("---------\n");
-   printf("   [expr]A    open internal cell/show regs\n");
-   printf("   [expr]B    set/display breakpoint\n");
-   printf("   [expr]D    delete [exp] breakpoint\n");
-   printf("   E          show event QUE\n");
-   printf("   F<char>    set cell fmt\n");
-   printf("   [expr]H    set/display instr. history, 0 - clear\n");
-   printf("   I          I/O reset\n");
-   printf("   K          cancel line\n");
-   printf("   <expr>L    program load, bit0=1 - data channel load\n");
-   printf("   [<expr>]M  set/display memory cycle [300..2600] nS\n");
-   printf("              0< - exact timing\n");
-   printf("   [expr]O    step\n");
-   printf("   P          proceed\n");
-   printf("   [expr]Q    quit YaNOVA\n");
-   printf("   <expr>R    run\n");
-   printf("   [expr]T    set/clear instr. trace\n");
-   printf("   <expr>X    modify device delay [1..100000] uS\n");
-   printf("   [expr]Z    set/display KIPS (#instr/mS)\n");
-   printf("   ?          display help\n");
-   printf("   !cmd       execute shell command\n");
+   printf("   [expr]A      open internal cell/show regs\n");
+   printf("   [expr]B      set/display breakpoint\n");
+   printf("   [expr]D      delete [exp] breakpoint\n");
+   printf("   E            show event QUE\n");
+   printf("   F<char>      set cell fmt\n");
+   printf("   [expr]H      set/display instr. history, 0 - clear\n");
+   printf("   I            I/O reset\n");
+   printf("   K            cancel line\n");
+   printf("   <expr>L      program load, bit0=1 - data channel load\n");
+   printf("   [<expr>]M    set/display memory cycle [300..2600] nS\n");
+   printf("                0< - exact timing\n");
+   printf("   [expr]O      step\n");
+   printf("   P            proceed\n");
+   printf("   [expr]Q      quit YaNOVA\n");
+   printf("   <expr>R      run\n");
+   printf("   <expr>Sfile  slurp <expr> sectors from file\n");
+   printf("   [expr]T      set/clear instr. trace\n");
+   printf("   <expr>X      modify device delay [1..100000] uS\n");
+   printf("   [expr]Z      set/display KIPS (#instr/mS)\n");
+   printf("   ?            display help\n");
+   printf("   !cmd         execute shell command\n");
 
    printf("\nCell navigation:\n");
    printf("----------------\n");
@@ -2540,13 +2551,16 @@ void vconsole(void)
 
       if (NULL == fgets(line,80,stdin))
          exit(0);
+      x = strlen(line);
+      if (x && line[x-1] == '\n')
+         line[x-1] = '\0';
 
       cmd = line;
-VCDBG(fprintf(stderr,"cmd = [%s]\n",cmd));
+VCDBG(printf("cmd = [%s]\n",cmd));
       while (isspace(*cmd)) cmd++;
-VCDBG(fprintf(stderr,"isspace cmd = [%s]\n",cmd));
+VCDBG(printf("isspace cmd = [%s]\n",cmd));
       cmd = getexpr(cmd, &xpr, &xx);
-VCDBG(fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
+VCDBG(printf("getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
       if (dly) {
          if (xpr) {
             if (0 < xx && xx <= 100000)
@@ -2564,7 +2578,7 @@ VCDBG(fprintf(stderr,"getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
             if (cello < 0) IC[adr] = x;
             else M[adr] = x;
          }
-VCDBG(fprintf(stderr,"cello cmd=[%s]\n",cmd));
+VCDBG(printf("cello cmd=[%s]\n",cmd));
          switch (*cmd) {
          case  '!': cello = 0; break;
          case ASC_LF:
@@ -2583,14 +2597,16 @@ VCDBG(fprintf(stderr,"cello cmd=[%s]\n",cmd));
       if (!*cmd)
          continue;
 
-      strupper(line);
-      if (strchr(line,'K')) continue;
+      *cmd = toupper(*cmd);
+      if ('!' != *cmd && 'S' != *cmd)
+         strupper(cmd);
+      if (strchr(cmd,'K')) continue;
 
-      if (NULL != strchr("/LRX",*cmd) && !xpr) { /* arg required */
+      if (NULL != strchr("/LRSX",*cmd) && !xpr) { /* arg required */
          err = 1; continue;
       }
 
-VCDBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
+VCDBG(printf("switch cmd = [%s]\n",cmd));
       switch (*cmd++) {
       case 'A': /* open internal cell */
          if (xpr) { cello = -1; adr = x; }
@@ -2684,6 +2700,23 @@ VCDBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
          IC[IC_PC] = 077777 & x;
          ic2regs(); run(); regs2ic();
          break;
+      case 'S': /* slurp n sectors at PC */
+         {
+            FILE *fd;
+            fd = fopen(cmd,"rb");
+            if (NULL != fd) {
+               int i;
+               Word w, adr = IC[IC_PC];
+               if (x > 128) x = 128;
+               for (i = 0; i < x * SEC_SIZE; i++) {
+                  fread(&w, sizeof(Word), 1, fd);
+                  memWriteIO(adr++, SWAP(w));
+               }
+               fclose(fd);
+            }
+            else printf("cannot open %s!\n",cmd);
+         }
+         break;
       case 'T': /* set/clear instr. trace */
          if (xpr) { Trace = xx; }
          printf("trace = %o\n", Trace);
@@ -2706,7 +2739,7 @@ VCDBG(fprintf(stderr,"switch cmd = [%s]\n",cmd));
          usage();
          break;
       case '!': /* exec shell command line */
-         system(++cmd);
+         system(cmd);
          break;
       default: err = 1;
       }
