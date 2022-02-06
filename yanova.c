@@ -1848,15 +1848,15 @@ void execute(Word IR)
          break;
       case 3: /* INC */
          result = AC[acs] + 1;
-         if (result < AC[acs]) cy = 1 - cy;
+         if (0177777 == AC[acs]) cy = 1 - cy;
          break;
       case 4: /* ADC */
          result = AC[acd] + ~AC[acs];
-         if (result < AC[acd]) cy = 1 - cy;
+         if (AC[acd] > AC[acs]) cy = 1 - cy;
          break;
       case 5: /* SUB */
          result = AC[acd] - AC[acs];
-         if (result > AC[acd]) cy = 1 - cy;
+         if (AC[acd] >= AC[acs]) cy = 1 - cy;
          break;
       case 6: /* ADD */
          result = AC[acd] + AC[acs];
