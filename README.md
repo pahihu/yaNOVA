@@ -9,6 +9,7 @@ Options:
   * set disc controller shared, -DEVshared=0|1
 
 Changes:
+  * fixed some DKP behavior, CPU Carry generation, got RDOS "DISK ERR=000000"
   * Ctrl-E break into virtual console
   * sector load into memory
   * instruction trace

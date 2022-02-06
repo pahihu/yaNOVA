@@ -4,12 +4,8 @@
  *
 */
 
-#ifdef YAN_DEBUG
-#define DBG(x)    x
-#else
-#define DBG(x)
-#endif
 #define VCDBG(x)
+#define TRACE(x)  if(Trace){x;}
 
 #define VER_VER   0
 #define VER_REL   0
@@ -56,6 +52,7 @@ void Assert(char *path,int lno, char *msg, int cond)
 }
 #define ASSERT(cond) Assert(__FILE__,__LINE__,""#cond,cond)
 
+Word Trace;          /* trace instr. execution         */
 enum {
    H_Run,
    H_Startup,
@@ -74,7 +71,7 @@ char *halts[] = {
    "system startup",
    "halt",
    "break",
-   "undefined instruction",
+   "undefined instr/operation",
    "indirection chain",
    "missing device",
    "I/O error",
@@ -84,7 +81,7 @@ char *halts[] = {
 
 void SetHalt(char *path,int lno,int n)
 {
-   DBG(printf("%s:%d: Halt = %d\n",path,lno,n));
+   TRACE(printf("%s:%d: Halt = %d\n",path,lno,n));
    Halt = n;
 }
 
@@ -151,9 +148,9 @@ typedef enum {LPT_IDLE,LPT_XMIT,LPT_FULL,LPT_CTRL} PrinterOp;
 #define DSK_E_WRITE  020
 #define DSK_E_ERROR  01
 
-#define DKP_DMC      buf[BUF_A]
-#define DKP_ACNT     buf[BUF_B]
-#define DKP_DSS      buf[BUF_C]
+#define DKP_CSR      buf[BUF_A]
+#define DKP_MAC      buf[BUF_B]
+#define DKP_DAR      buf[BUF_C]
 #define DKP_NSEC     4872
 
 #define DKP_DRV(x)   ((x) >> 14)
@@ -276,7 +273,6 @@ int IREQ;            /* no. of pending INT requests */
 Flag delayION;       /* delayed ION */
 Device devs[64];
 Flag MissingDev;     /* allow/disallow missing devices */
-Word Trace;          /* trace instr. execution         */
 
 int  nBKPT;  /* breakpoints */
 #define MAX_BKPT   8
@@ -364,6 +360,7 @@ void IORST(void)                                /* IORST */
    q = BUS;                                     /* clear ctrl FFs in all devs */
    while (q) {
       devClear(q->devno);                       /* Clear dev (intreq cleared) */
+      q->buf[0] = q->buf[1] = q->buf[2] = 0;    /* clear buffers    */
       q->intdis = false;                        /* clear IntDisable */
       q = q->bus;                               /* next device on BUS */
    }
@@ -372,6 +369,9 @@ void IORST(void)                                /* IORST */
       clearEVT(&events[i]);
    QUE = NULL;
 }
+
+
+static char *io_regs[] = {"A", "B", "C", "?"};
 
 Word devIN(Byte devno, int reg)                 /* Device INPUT */
 {
@@ -426,7 +426,7 @@ Word devIN(Byte devno, int reg)                 /* Device INPUT */
       {  int uno;
          Flag rdy;
 
-         uno = DKP_DRV(dev->DKP_DMC);           /* calc. unit number */
+         uno = DKP_DRV(dev->DKP_CSR);           /* calc. unit number */
          switch (reg) {
          case BUF_A:
             rdy = true;
@@ -437,30 +437,32 @@ Word devIN(Byte devno, int reg)                 /* Device INPUT */
                rdy = false;
             if (rdy) dev->status |= DKP_RDY;
             else dev->status &= ~DKP_RDY;
+            if (076 & dev->status)              /* any Error flag set? */
+               dev->status |= DKP_E_ERROR;      /*    report ERROR     */
             w = dev->status;                    /* DKP status register */
             break;
          case BUF_B:                            /* read address counter */
             break;
          case BUF_C:
-            w = dev->units[uno].DKP_DSS;        /* read unit DSS status */
+            w = dev->units[uno].DKP_DAR;        /* read unit DAR status */
             break;
          }
       }
       break;
    }
 
+   TRACE(printf("IODATI %s=%06o\n",io_regs[reg],w));
    return w;
 }
 
 void devOUT(Byte devno, int reg, Word w)        /* Device OUTPUT */
 {
-   static char *regs[] = {"A", "B", "C", "?"};
    Device *q, *dev;
 
    dev = &devs[devno];                          /* point to device   */
    if (NO_LINE != dev->line) {                  /* device installed? */
       dev->buf[reg] = w;                        /* set buffer        */
-      DBG(printf("IODATO %s=%06o\n",regs[reg],w));
+      TRACE(printf("IODATO %s=%06o\n",io_regs[reg],w));
    }
 
    switch (devno) {
@@ -654,18 +656,20 @@ int initDKP(Device *dev, int uno, CtrlFn *pCtrlfn)/* Init DKP operation */
    ctrlfn = *pCtrlfn;
 
    dev->status &= 0177700;                      /* clear error flags  */
-   mode = DKP_MOD(dev->DKP_DMC);                /* get mode */
+   mode = DKP_MOD(dev->DKP_CSR);                /* get mode */
 
-DBG(printf("INIDKP %06o %02o ctrlfn=%d mode=%d\n",
-            PC,dev->devno,ctrlfn,mode));
+   TRACE(printf("INIDKP %06o %02o:%d ctrlfn=%d mode=%d\n",
+                  PC,dev->devno,uno,ctrlfn,mode));
 
-   if (IOC_PULSE == ctrlfn && DKP_MSEEK == mode) {
-      cylinder = DKP_CYL(dev->DKP_DMC);         /* get target cylinder */
-      if (cylinder > (DKP_GEO_CC-1)) {          /* no such cylinder?   */
-         dev->status |= DKP_E_SEEK;             /*    SEEK error       */
-         goto ErrOut;                           /*    done!            */
-      }
+   cylinder = DKP_CYL(dev->DKP_CSR);            /* get target cylinder */
+   if (cylinder > (DKP_GEO_CC-1)) {             /* no such cylinder?   */
+      dev->status |= DKP_E_SEEK;                /*    SEEK error       */
+      dev->status |= DKP_DONE_SEEK(uno);        /*    SEEKu done       */ 
+      goto ErrOut;                              /*    done!            */
    }
+
+   if (dev->units[uno].fd == NULL)              /* no such unit?       */
+      goto ErrOut;
 
    if (dev->shared) {                           /* shared disc?      */
       if (!dev->locked) {                       /* not locked yet?   */
@@ -682,10 +686,10 @@ DBG(printf("INIDKP %06o %02o ctrlfn=%d mode=%d\n",
       ASSERT(true);                             /* cannot be NONE */
       break;
    case IOC_START:                              /* Read/Write */
-      if (DKP_MREAD == mode || DKP_MWRITE == mode){/* Read/Write? */
-         sector = DKP_SEC(dev->DKP_DSS);        /* get sector          */
-         if (sector > (DKP_GEO_SS-1)) {         /* no such sector?     */
-DBG(printf("%06o %02o FOREVER\n",PC,dev->devno));
+      if (DKP_MREAD == mode || DKP_MWRITE == mode){/* Read/Write?    */
+         sector = DKP_SEC(dev->DKP_DAR);        /* get sector        */
+         if (sector > (DKP_GEO_SS-1)) {         /* no such sector?   */
+            TRACE(printf("%06o %02o FOREVER\n",PC,dev->devno));
             dev->delay = FOREVER;               /*    it takes forever */
          }
          else {
@@ -706,19 +710,23 @@ DBG(printf("%06o %02o FOREVER\n",PC,dev->devno));
                dev->delay += 20000;             /* half rev. */
          }
       }
-      else
+      else {
+         Halt = H_Undef;
          return 1;                              /* Seek/Recalibrate w/ Start */
+      }
       break;
    case IOC_CLEAR:
       ASSERT(true);                             /* cannot be Clear */
       break;
    case IOC_PULSE:                              /* Seek/Recalibrate */
       if (DKP_MRECAL == mode)                   /* Recalibrate? */
-         delay = 20000 * DKP_CYL(dev->units[uno].DKP_DMC);/* 20ms * cylinder */
+         delay = 20000 * DKP_CYL(dev->units[uno].DKP_CSR);/* 20ms * cylinder */
       else if (DKP_MSEEK == mode)                 /* Seek? */
-         delay = 20000 * abs(DKP_CYL(dev->units[uno].DKP_DMC) - DKP_CYL(dev->DKP_DMC));
-      else
+         delay = 20000 * abs(DKP_CYL(dev->units[uno].DKP_CSR) - DKP_CYL(dev->DKP_CSR));
+      else {
+         Halt = H_Undef;
          return 1;                              /* Read/Write w/ Pulse */
+      }
       if (delay > 135000)                       /* max. 135ms   */
          delay = 135000;
       else if (delay < 20000)
@@ -729,11 +737,8 @@ DBG(printf("%06o %02o FOREVER\n",PC,dev->devno));
    return 0;
 
 ErrOut:
-   if (dev->status) {                           /* any error?     */
-      dev->status |= DKP_E_ERROR;               /* set ERROR flag */
-      dev->delay = 2 * memTime / 10;            /* report ERROR   */
-      *pCtrlfn = IOC_NONE;                      /* no actual I/O  */
-   }
+   dev->delay = 2 * memTime / 10;               /* report ERROR   */
+   *pCtrlfn = IOC_NONE;                         /* no actual I/O  */
 
    return 0;
 }
@@ -743,38 +748,40 @@ void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
    Byte uno, scnt;
    off_t offs;
    Word buf[SEC_SIZE];
-   Word acnt, dmc, dss;
+   Word mac, csr, dar;
    int  i, n, mode, sic;
 
    ASSERT(dev->devno == evt->devno);            /* ensure same devno */ 
 
    uno  = evt->uno;                             /* get unit number   */
-   dmc  = dev->units[uno].DKP_DMC;              /* get Mode/Cylinder */
-   dss  = dev->units[uno].DKP_DSS;              /* get Drive/Surf/Sec/SCnt */
+   csr  = dev->units[uno].DKP_CSR;              /* get Mode/Cylinder */
+   dar  = dev->units[uno].DKP_DAR;              /* get Drive/Surf/Sec/SCnt */
 
-   ASSERT(uno == DKP_DRV(dss));                 /* ensure same unit  */
+   ASSERT(uno == DKP_DRV(dar));                 /* ensure same unit  */
 
-   mode = DKP_MOD(dmc);                         /* get unit mode     */
+   mode = DKP_MOD(csr);                         /* get unit mode     */
+   mac  = 077777 & dev->DKP_MAC;                /* get address counter */
+   scnt = DKP_SCNT(dar);                        /* get sector counter  */
+
+   TRACE(printf("IODONE %06o mode=%d mac=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
+                  PC,mode,mac,scnt,dev->status,
+                  DKP_CYL(csr),DKP_HED(dar),DKP_SEC(dar)));
+
    switch (evt->ctrlfn) {
    case IOC_NONE:                               /* just delayed error */
       break;
    case IOC_START:
       if (DKP_MREAD != mode && DKP_MWRITE != mode) /* just READ or WRITE */
          ASSERT(true);
-      acnt = dev->DKP_ACNT;                     /* get address counter */
-      scnt = DKP_SCNT(dss);                     /* get sector counter  */
-DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
-         PC,mode,acnt,scnt,dev->status,
-         DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
-      offs =                     DKP_CYL(dmc);  /* calc. offset        */
-      offs = DKP_GEO_HH * offs + DKP_HED(dss);
-      offs = DKP_GEO_SS * offs + DKP_SEC(dss);
+      offs =                     DKP_CYL(csr);  /* calc. offset        */
+      offs = DKP_GEO_HH * offs + DKP_HED(dar);
+      offs = DKP_GEO_SS * offs + DKP_SEC(dar);
       if (-1 == fseeko(dev->units[uno].fd, offs, SEEK_CUR)) {
          HALT(H_IOErr);
          return;
       }
-      sic  = DKP_GEO_SS * DKP_HED(dss);         /* sector in cylinder  */
-      sic += DKP_SEC(dss);
+      sic  = DKP_GEO_SS * DKP_HED(dar);         /* sector in cylinder  */
+      sic += DKP_SEC(dar);
       do {
          if (DKP_MREAD == mode) {               /* handle READ         */
             n = fread(&buf[0], sizeof(Word), SEC_SIZE, dev->units[uno].fd);
@@ -783,11 +790,11 @@ DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
                return;
             }
             for (i = 0; i < SEC_SIZE; i++)      /* write buffer to     */
-               memWriteIO(acnt++, SWAP(buf[i]));/*    memory           */
+               memWriteIO(mac++, SWAP(buf[i])); /*    memory           */
          }
          else if (DKP_MWRITE == mode) {         /* handle WRITE        */
             for (i = 0; i < SEC_SIZE; i++)      /* read buffer from    */
-               buf[i] = SWAP(memReadIO(acnt++));/*    memory           */
+               buf[i] = SWAP(memReadIO(mac++)); /*    memory           */
             n = fwrite(&buf[0], sizeof(Word), SEC_SIZE, dev->units[uno].fd);
             if (n != SEC_SIZE) {                /* I/O failed?         */
                HALT(H_IOErr);                   /*    HALT             */
@@ -795,14 +802,11 @@ DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
             }
          }
          scnt = 017 & (scnt + 1);               /* incr. sector count   */
-         /* "When the sector count reaches zero, the control terminates
-          *  the command (with the counters pointing to the last block
-          *  processed" pp. 5-10
-         */
          if (scnt) {
             sic++;                              /* incr. sector in cylinder*/
             if (DKP_GEO_HHSS == sic) {          /* end of cylinder? */
                dev->status |= DKP_E_END;        /*    report END error  */
+               sic = 0;
                break;
             }
          }
@@ -811,25 +815,26 @@ DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
       dev->units[uno].lastRW  = elapsedTime;    /* save lastRW and */
       dev->units[uno].lastSEC = sic % DKP_GEO_SS;  /*    position  */
 
-                                                /* update DSS      */
-      dss &= 0177000;                           /* clear Surf/Sec/SCnt*/
+                                                /* update DAR      */
+      dar &= 0177000;                           /* clear Surf/Sec/SCnt*/
       if (sic == DKP_GEO_HHSS)                  /* update Surf/Sec */
          sic = 0;
       if (sic > (DKP_GEO_SS-1)) {
-         dss |= 0400; sic -= DKP_GEO_SS;
+         dar |= 0400; sic -= DKP_GEO_SS;
       }
-      dss |= (017 & sic) << 4;
-      dss |= scnt;                              /* update SCnt     */
-      dev->units[uno].DKP_DSS = dss;
+      dar |= (017 & sic) << 4;
+      dar |= scnt;                              /* update SCnt     */
+      dev->units[uno].DKP_DAR = dar;
       if (DKP_MWRITE == mode)                   /* adjust adr counter     */
-         acnt += 2;                             /*    if WRITE            */
-      dev->DKP_ACNT = 077777 & acnt;            /* update adr counter     */
+         mac += 2;                              /*    if WRITE            */
+      dev->DKP_MAC = mac;                       /* update adr counter     */
+                                                /* do NOT clear bit0      */
       dev->status |= DKP_DONE_RW;               /* R/W done               */
       if (scnt)                                 /* non-zero sector count? */
          dev->status |= DKP_E_END;              /*    report END error    */
-DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
-         PC,mode,acnt,scnt,dev->status,
-         DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
+         TRACE(printf("IODONE %06o mode=%d mac=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
+                     PC,mode,mac,scnt,dev->status,
+                     DKP_CYL(csr),DKP_HED(dar),DKP_SEC(dar)));
       break;
    case IOC_CLEAR:
       ASSERT(true);                             /* cannot be CLEAR    */
@@ -839,13 +844,13 @@ DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
       ASSERT(0 != (dev->status & DKP_SEEKING(uno)));
       dev->units[uno].lastRW = 0;               /* clear last R/W     */
       if (DKP_MRECAL == mode)
-         dev->units[uno].DKP_DMC = 0;
+         dev->units[uno].DKP_CSR = 0;
       else if (DKP_MSEEK == mode) {
          offs  = SEC_BYTES;
-         offs *= DKP_GEO_HHSS * DKP_CYL(dev->units[uno].DKP_DMC);
+         offs *= DKP_GEO_HHSS * DKP_CYL(dev->units[uno].DKP_CSR);
       }
       else
-         ASSERT(true);                          /* fail in other Modes */
+         ASSERT(true);
       if (-1 == fseeko(dev->units[uno].fd, offs, SEEK_SET)) /* I/O error? */
          HALT(H_IOErr);                         /*    HALT             */
       dev->status &= ~DKP_SEEKING(uno);         /* clear Seeking flag  */
@@ -866,18 +871,21 @@ void devStart(Byte devno)                       /* Start device `dev' */
    if (NO_LINE == dev->line)                    /* no such device */
       return;                                   /*    do nothing  */
 
+   uno = 0;
+   if (DEV_DKP == devno)                        /* calc. drive for DKP */
+      uno = DKP_DRV(dev->DKP_DAR);
+
+   TRACE(printf("IOSTAR %06o %02o:%d Busy=%d,Done=%d\n",
+               PC,dev->devno,uno,dev->busy,dev->done));
+
    if (dev->busy)                               /* device busy?   */
       return;                                   /*    do nothing. */
 
-   uno = 0;
    switch (devno) {
    case DEV_PTR:
    case DEV_PTP:
    case DEV_LPT:
    case DEV_DSK:
-   case DEV_DKP:
-      if (DEV_DKP == devno)                     /* calc. drive for DKP */
-         uno = DKP_DRV(dev->DKP_DSS);
       if (!dev->units[uno].fd) {                /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
             HALT(H_MisDev);                     /*    HALT           */
@@ -960,21 +968,21 @@ void devStart(Byte devno)                       /* Start device `dev' */
             return;                             /* failed, return     */
          break;
       case DEV_DKP:
-         uno = DKP_DRV(dev->DKP_DSS);
+         uno = DKP_DRV(dev->DKP_DAR);
          if (initDKP(dev, uno, &ctrlfn))        /* init I/O operation */
             return;                             /* failed, return     */
-         dev->units[uno].DKP_DMC = dev->DKP_DMC;/* save regs, to units */
-         dev->units[uno].DKP_DSS = dev->DKP_DSS;
-DBG(printf("REGDKP %06o %02o %d DMC=%06o DSS=%06o\n",
-            PC,dev->devno,uno,dev->DKP_DMC,dev->DKP_DSS));
+         dev->units[uno].DKP_CSR = dev->DKP_CSR;/* save regs, to units */
+         dev->units[uno].DKP_DAR = dev->DKP_DAR;
+         TRACE(printf("REGDKP %06o %02o:%d CSR=%06o DAR=%06o\n",
+                        PC,dev->devno,uno,dev->DKP_CSR,dev->DKP_DAR));
          break;
       }
 
       dev->busy = true;                         /* Busy=1,Done=0 */
       dev->done = false;
 
-      DBG(printf("IOSTAR %06o %02o ctrlfn=%d delay=%d\n",
-            PC,dev->devno,ctrlfn,dev->delay));
+      TRACE(printf("IOSTAR %06o %02o:%d ctrlfn=%d delay=%d\n",
+                     PC,dev->devno,uno,ctrlfn,dev->delay));
       enqueIO(dev, uno, ctrlfn);                /* enqueue I/O */
    }
 }
@@ -997,12 +1005,14 @@ void devClear(Byte devno)                       /* Clear device `dev' */
       dev->status = 0;
    }
 
-   if (DEV_CPU != devno)                        /* clear buffers */
-      dev->buf[BUF_A] = 0;                      /* except CPU buffer A (SW) */
-   if (DEV_MDV != devno)
-      dev->buf[BUF_B] = 0;                      /* MDV just clear buffer A */
-   if (DEV_MDV != devno)
-      dev->buf[BUF_C] = 0;
+   if (DEV_DSK != devno && DEV_DKP != devno) {
+      if (DEV_CPU != devno)                     /* clear buffers */
+         dev->buf[BUF_A] = 0;                   /* except CPU buffer A (SW) */
+      if (DEV_MDV != devno)
+         dev->buf[BUF_B] = 0;                   /* MDV just clear buffer A */
+      if (DEV_MDV != devno)
+         dev->buf[BUF_C] = 0;
+   }
 
    done = false;
    while (!done) {                              /* remove all events for devno*/
@@ -1029,8 +1039,8 @@ void devClear(Byte devno)                       /* Clear device `dev' */
    dev->busy = false;                           /* clear control FFs */
    dev->done = false;
 
-   DBG(printf("IOCLER %06o %02o ctrlfn=%d\n",
-               PC,dev->devno,IOC_CLEAR));
+   TRACE(printf("IOCLER %06o %02o ctrlfn=%d\n",
+                  PC,dev->devno,IOC_CLEAR));
 
    if (dev->intreq) {                           /* INT request pending?  */
       dev->intreq = false; IREQ--;              /* clear dev and CPU flag*/
@@ -1051,7 +1061,7 @@ void devPulse(Byte devno)                       /* Pulse device `dev' */
    case DEV_DSK:
    case DEV_DKP:
       if (DEV_DKP == devno)                     /* calc. drive for DKP */
-         uno = DKP_DRV(dev->DKP_DSS);
+         uno = DKP_DRV(dev->DKP_DAR);
       if (!dev->units[uno].fd) {                /* no file assigned? */
          if (!MissingDev)                       /* no missing devs allowed? */
             HALT(H_MisDev);                     /*    HALT           */
@@ -1077,7 +1087,7 @@ void devPulse(Byte devno)                       /* Pulse device `dev' */
                   PC,M[PC]);
       break;
    case DEV_DKP:
-      uno = DKP_DRV(dev->DKP_DSS);              /* get unit number    */
+      uno = DKP_DRV(dev->DKP_DAR);              /* get unit number    */
       if (dev->status & DKP_SEEKING(uno))       /* already Seek or Recal? */
          return;
       if (initDKP(dev, uno, &ctrlfn))           /* init I/O operation */
@@ -1085,10 +1095,10 @@ void devPulse(Byte devno)                       /* Pulse device `dev' */
       dev->status &= 0177700;                   /* clear error flags  */
       dev->status |= DKP_SEEKING(uno);          /* set seeking flag   */
                                                 /* XXX: set by Recal? */
-      dev->units[uno].DKP_DMC = dev->DKP_DMC;   /* save regs, to units */
-      dev->units[uno].DKP_DSS = dev->DKP_DSS;
-DBG(printf("REGDKP %06o %02o %d DMC=%06o DSS=%06o\n",
-            PC,dev->devno,uno,dev->DKP_DMC,dev->DKP_DSS));
+      dev->units[uno].DKP_CSR = dev->DKP_CSR;   /* save regs, to units */
+      dev->units[uno].DKP_DAR = dev->DKP_DAR;
+      TRACE(printf("REGDKP %06o %02o %d CSR=%06o DAR=%06o\n",
+                     PC,dev->devno,uno,dev->DKP_CSR,dev->DKP_DAR));
       break;
    default:                                     /* default case:       */
       return;                                   /*    do NOT start I/O */
@@ -1098,8 +1108,8 @@ DBG(printf("REGDKP %06o %02o %d DMC=%06o DSS=%06o\n",
       dev->busy = true;                        /* Busy=1,Done=0 */
    dev->done = false;
 
-   DBG(printf("IOPULS %06o %02o ctrlfn=%d delay=%d\n",
-               PC,dev->devno,ctrlfn,dev->delay));
+   TRACE(printf("IOPULS %06o %02o ctrlfn=%d delay=%d\n",
+                  PC,dev->devno,ctrlfn,dev->delay));
 
    enqueIO(dev, uno, ctrlfn);
 
@@ -1154,7 +1164,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
       dev->busy = false;
       break;
    case DEV_DKP:
-      if (IOC_START == evt->ctrlfn) {           /* Seek/Recalibrate does */
+      if (IOC_PULSE != evt->ctrlfn) {           /* Seek/Recalibrate does */
          dev->done = true;                      /*    NOT set Done       */
          dev->busy = false;
       }
@@ -1266,7 +1276,7 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
        && false == dev->intreq)                 /*    AND IntReq clear?     */
    {
       dev->intreq = true; IREQ++;               /* trigger an INT request */
-DBG(printf("IOIREQ %06o %02o\n",PC,dev->devno));
+      TRACE(printf("IOIREQ %06o %02o\n",PC,dev->devno));
    }
 }
 
@@ -1806,7 +1816,7 @@ void execute(Word IR)
 
    numInstr++;
    if (IR > 077777) {   /* arithmetic/logic */
-      Word aluA, result;
+      Word result;
       Flag ncy, cy;
       int cond;
       int acs, acd, fn, shift, carry, noload, skip;
@@ -1830,27 +1840,34 @@ void execute(Word IR)
          cy = 1 - CRY; break;
       }
 
-      aluA = 4 & fn? AC[acd] : 0;
-      switch (fn & 3) {
-      case 0: /* COM ADC */
-         result = aluA + ~AC[acs];
-         if (result < AC[acs]) cy = 1 - cy;
+      switch (fn) {
+      case 0: /* COM */
+         result = ~AC[acs];
          break;
       case 1: /* NEG SUB */
-         result = aluA - AC[acs];
-         if (result < AC[acs]) cy = 1 - cy;
+         result = -AC[acs];
          break;
       case 2: /* MOV ADD */
-         result = aluA + AC[acs];
+         result = AC[acs];
+         break;
+      case 3: /* INC */
+         result = AC[acs] + 1;
          if (result < AC[acs]) cy = 1 - cy;
          break;
-      case 3: /* INC AND */
-         if (7 == fn)
-            result = aluA & AC[acs];
-         else {
-            result = AC[acs] + 1;
-            if (result < AC[acs]) cy = 1 - cy;
-         }
+      case 4: /* ADC */
+         result = AC[acd] + ~AC[acs];
+         if (AC[acd] > AC[acs]) cy = 1 - cy;
+         break;
+      case 5: /* SUB */
+         result = AC[acd] - AC[acs];
+         if (AC[acd] >= AC[acs]) cy = 1 - cy;
+         break;
+      case 6: /* ADD */
+         result = AC[acd] + AC[acs];
+         if (result < AC[acs]) cy = 1 - cy;
+         break;
+      case 7: /* AND */
+         result = AC[acd] & AC[acs];
          break;
       }
 
@@ -2592,11 +2609,11 @@ void vconsole(void)
          line[x-1] = '\0';
 
       cmd = line;
-VCDBG(printf("cmd = [%s]\n",cmd));
+      VCDBG(printf("cmd = [%s]\n",cmd));
       while (isspace(*cmd)) cmd++;
-VCDBG(printf("isspace cmd = [%s]\n",cmd));
+      VCDBG(printf("isspace cmd = [%s]\n",cmd));
       cmd = getexpr(cmd, &xpr, &xx);
-VCDBG(printf("getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
+      VCDBG(printf("getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
       if (dly) {
          if (xpr) {
             if (0 < xx && xx <= 100000)
@@ -2614,7 +2631,7 @@ VCDBG(printf("getnum  cmd = [%s] xpr=%d xx=%d\n",cmd, xpr, xx));
             if (cello < 0) IC[adr] = x;
             else M[adr] = x;
          }
-VCDBG(printf("cello cmd=[%s]\n",cmd));
+         VCDBG(printf("cello cmd=[%s]\n",cmd));
          switch (*cmd) {
          case  '!': cello = 0; break;
          case ASC_LF:
@@ -2642,7 +2659,7 @@ VCDBG(printf("cello cmd=[%s]\n",cmd));
          err = 1; continue;
       }
 
-VCDBG(printf("switch cmd = [%s]\n",cmd));
+      VCDBG(printf("switch cmd = [%s]\n",cmd));
       switch (*cmd++) {
       case 'A': /* open internal cell */
          if (xpr) { cello = -1; adr = x; }
