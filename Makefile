@@ -1,7 +1,7 @@
 CC = cc -g
 CFLAGS = -Wall -ansi -pedantic
 
-SRCS = yanova.c
+SRCS = yanova.c curterm.c
 OBJS = $(SRCS:.c=.o)
 
 all: yanova

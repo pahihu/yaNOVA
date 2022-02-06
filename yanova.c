@@ -4,8 +4,11 @@
  *
 */
 
-/* #define DBG(x)    x */
+#ifdef YAN_DEBUG
+#define DBG(x)    x
+#else
 #define DBG(x)
+#endif
 #define VCDBG(x)
 
 #define VER_VER   0
@@ -21,6 +24,8 @@
 #include <sys/file.h>                           /* flock()        */
 #include <sys/time.h>                           /* gettimeofday() */
 #include <unistd.h>                             /* usleep()       */
+
+#include "curterm.h"
 
 typedef unsigned char Byte;
 typedef unsigned short Word;
@@ -60,7 +65,8 @@ enum {
    H_Indir,
    H_MisDev,
    H_IOErr,
-   H_ReadOnly
+   H_ReadOnly,
+   H_VCon
 } Halt;
 
 char *halts[] = {
@@ -72,7 +78,8 @@ char *halts[] = {
    "indirection chain",
    "missing device",
    "I/O error",
-   "drive read-only"
+   "drive read-only",
+   "virtual console"
 };
 
 void SetHalt(char *path,int lno,int n)
@@ -447,11 +454,14 @@ Word devIN(Byte devno, int reg)                 /* Device INPUT */
 
 void devOUT(Byte devno, int reg, Word w)        /* Device OUTPUT */
 {
+   static char *regs[] = {"A", "B", "C", "?"};
    Device *q, *dev;
 
    dev = &devs[devno];                          /* point to device   */
-   if (NO_LINE != dev->line)                    /* device installed? */
+   if (NO_LINE != dev->line) {                  /* device installed? */
       dev->buf[reg] = w;                        /* set buffer        */
+      DBG(printf("IODATO %s=%06o\n",regs[reg],w));
+   }
 
    switch (devno) {
    case DEV_CPU:                                /* CPU? */
@@ -753,8 +763,9 @@ void doioDKP(Device *dev, Event *evt)           /* Perform DKP I/O */
          ASSERT(true);
       acnt = dev->DKP_ACNT;                     /* get address counter */
       scnt = DKP_SCNT(dss);                     /* get sector counter  */
-DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
-         PC,mode,acnt,scnt,DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
+DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
+         PC,mode,acnt,scnt,dev->status,
+         DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
       offs =                     DKP_CYL(dmc);  /* calc. offset        */
       offs = DKP_GEO_HH * offs + DKP_HED(dss);
       offs = DKP_GEO_SS * offs + DKP_SEC(dss);
@@ -816,6 +827,9 @@ DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%o (%d,%d,%d)\n",
       dev->status |= DKP_DONE_RW;               /* R/W done               */
       if (scnt)                                 /* non-zero sector count? */
          dev->status |= DKP_E_END;              /*    report END error    */
+DBG(printf("IODONE %06o mode=%d acnt=%06o scnt=%02o status=%06o (%d,%d,%d)\n",
+         PC,mode,acnt,scnt,dev->status,
+         DKP_CYL(dmc),DKP_HED(dss),DKP_SEC(dss)));
       break;
    case IOC_CLEAR:
       ASSERT(true);                             /* cannot be CLEAR    */
@@ -951,6 +965,8 @@ void devStart(Byte devno)                       /* Start device `dev' */
             return;                             /* failed, return     */
          dev->units[uno].DKP_DMC = dev->DKP_DMC;/* save regs, to units */
          dev->units[uno].DKP_DSS = dev->DKP_DSS;
+DBG(printf("REGDKP %06o %02o %d DMC=%06o DSS=%06o\n",
+            PC,dev->devno,uno,dev->DKP_DMC,dev->DKP_DSS));
          break;
       }
 
@@ -1071,6 +1087,8 @@ void devPulse(Byte devno)                       /* Pulse device `dev' */
                                                 /* XXX: set by Recal? */
       dev->units[uno].DKP_DMC = dev->DKP_DMC;   /* save regs, to units */
       dev->units[uno].DKP_DSS = dev->DKP_DSS;
+DBG(printf("REGDKP %06o %02o %d DMC=%06o DSS=%06o\n",
+            PC,dev->devno,uno,dev->DKP_DMC,dev->DKP_DSS));
       break;
    default:                                     /* default case:       */
       return;                                   /*    do NOT start I/O */
@@ -1182,11 +1200,16 @@ void devDone(Event *evt)                       /* Device done, ie timed out */
       printf("%c",toupper(ch));                 /* write upper case char */
       break;
    case DEV_TTI:                                /* TTI? */
-      if (dev->units[0].fd)
-         ch = readChar(dev);
-      else
-         ch = getchar();
-      dev->buf[BUF_A] = toupper(ch);            /* read upper case char */
+      if (dev->units[0].fd) {
+         ch = readChar(dev);                    /* 8bit char */
+         dev->buf[BUF_A] = ch;
+      }
+      else {
+         if (has_key()) {                       /* check TTY */
+            ch = getkey(0);
+            dev->buf[BUF_A] = toupper(ch);      /* read upper case char */
+         }
+      }
       break;
    case DEV_LPT:                                /* LPT? */
       {  PrinterOp op;
@@ -2001,10 +2024,22 @@ void step(void)
    }
 }
 
+#define CTRL_VC   (05)
+
 void run(void)
 {
-   while (!Halt)
+   int ch;
+
+   prepterm(1);                                 /* install terminal handler */
+   while (!Halt) {
+      if (has_key()) {                          /* key pressed?   */
+         ch = getkey(0);                        /*    get it      */
+         if (CTRL_VC == ch)                     /*    Ctrl-E?     */
+            Halt = H_VCon;                      /*       request VC */
+      }
       step();
+   }
+   prepterm(0);                                 /* remove terminal handler */
 }
 
 Word bootstrap[] = {    /* standard 32 word bootstrap loader */
@@ -2053,6 +2088,7 @@ void load(void)
    Word w, DIAS;
    int i;
 
+   w = 0;
    DIAS = (077 & SW) + 060500;
    for (i = 0; i < 32; i++)
       M[i] = bootstrap[i];

@@ -9,6 +9,8 @@ Options:
   * set disc controller shared, -DEVshared=0|1
 
 Changes:
+  * Ctrl-E break into virtual console
+  * sector load into memory
   * instruction trace
   * DKP controller (not debugged), unlock timeout
   * standalone event queue, each device can fire multiple events
