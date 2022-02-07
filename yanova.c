@@ -2333,7 +2333,7 @@ void showQUE(void)                              /* Show event QUE */
    }
 }
 
-#define NIC 18
+#define NIC 020
 Word IC[NIC]; /* internal cells */
 
 #define IC_AC0 0
@@ -2342,9 +2342,9 @@ Word IC[NIC]; /* internal cells */
 #define IC_AC3 3
 #define IC_PC  4
 #define IC_CRY 5
-#define IC_ION 10
-#define IC_SW  12
-#define IC_MSKO 17
+#define IC_ION 010
+#define IC_SW  012
+#define IC_MSKO 017
 
 #define LO(n)  ((n) & 0377)
 #define HI(n)  LO((n) >> 8)
@@ -2461,6 +2461,10 @@ char* getexpr(char *p, int *pxpr, int* px)      /* Get expression value */
    ret = 0; op = ' ';                           /* retval is zero, op is SP */
 Loop:
    x = 0; *pxpr = 0; base = 8; sign = 0;        /* init:positive oct, no expr */
+   if ('.' == *p) {                             /* current location?       */
+      *pxpr = 1; p++;                           /*    has expr, skip char  */
+      x = IC[IC_PC]; goto Out;                  /*    read PC, next        */
+   }
    if ('-' == *p) {                             /* negative?               */
       sign = 1; p++;                            /* remember, skip char     */
    }
@@ -2548,7 +2552,7 @@ void usage(void)
    printf("    17       Interrupt Mask (last MSKO)\n");
 
    printf("\n   <expr> := <expr> [+ | - <expr>]\n");
-   printf("   <expr> := [=]oct | %%dec | $hex | \"cc\n");
+   printf("   <expr> := . | [=]oct | %%dec | $hex | \"cc\n");
 
    printf("\nCell format:\n");
    printf("------------\n");
